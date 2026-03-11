@@ -22,6 +22,8 @@ where performance is measured using **predictive accuracy** on the OpenML CC18 b
 
 The pipeline predicts performance for each **flow × task** pair.
 
+![Scheme of the approach](diagram.png)
+
 ---
 
 # Features
