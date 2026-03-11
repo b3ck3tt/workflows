@@ -250,4 +250,5 @@ wilcoxon_task_group_kfold_mse.csv
 pipeline_artifacts.joblib
 ```
 
-
+## Licence
+MIT licence.
