@@ -9,6 +9,7 @@ __pycache__/
 
 # Claude project config
 .claude/
+CLAUDE.md
 
 # DiskCache directories (rebuildable from OpenML)
 minimal_cache_cc18/
