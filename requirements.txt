@@ -1,0 +1,17 @@
+# Core pipeline
+numpy
+pandas
+scipy
+scikit-learn
+joblib
+openml
+
+# Interpretability
+shap
+
+# Text embeddings (only needed for text_mode="minilm")
+sentence-transformers
+
+# Figures notebook
+seaborn
+matplotlib
