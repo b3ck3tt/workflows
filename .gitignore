@@ -11,6 +11,9 @@ __pycache__/
 .claude/
 CLAUDE.md
 
+# Paper artifacts (kept local)
+lacci2026/
+
 # DiskCache directories (rebuildable from OpenML)
 minimal_cache_cc18/
 
