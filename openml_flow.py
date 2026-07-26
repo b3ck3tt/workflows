@@ -1708,6 +1708,80 @@ def cross_val_flow_predictions(
     return pred_df
 
 
+def _require_lightgbm():
+    try:
+        import lightgbm  # noqa: F401
+    except ImportError as e:
+        raise ImportError(
+            "Package 'lightgbm' is required for the LambdaMART ranker "
+            "(model_name='lambdamart'). Install it with: pip install lightgbm"
+        ) from e
+
+
+def lambdamart_flow_predictions(
+    X,
+    y,
+    supervised_df: pd.DataFrame,
+    cv_folds: int = 5,
+    split_mode: str = "task_group_kfold",
+    random_state: int = 42,
+    n_estimators: int = 300,
+    learning_rate: float = 0.05,
+    num_leaves: int = 31,
+    min_child_samples: int = 20,
+    max_relevance: int = 31,
+) -> pd.DataFrame:
+    """Out-of-fold LambdaMART (LightGBM ranker) scores, one per (task, flow) row.
+
+    A learning-to-rank alternative to :func:`cross_val_flow_predictions`: each task is a
+    query group and the model optimizes NDCG directly instead of regressing accuracy.
+    Per-task graded relevance is the accuracy min-max scaled to integers ``0..max_relevance``.
+    Returns the same shape as :func:`cross_val_flow_predictions` (a ``y_pred`` column of
+    ranking scores, higher = recommended first) so it scores identically under
+    :func:`ranking_metrics_per_task`.
+    """
+    _require_lightgbm()
+    from lightgbm import LGBMRanker
+
+    groups = supervised_df["task_id"].to_numpy()
+    splitter = _get_splitter(split_mode, n_splits=cv_folds, random_state=random_state)
+    split_iter = (
+        splitter.split(X, y, groups=groups)
+        if split_mode == "task_group_kfold"
+        else splitter.split(X, y)
+    )
+
+    y_pred = np.full(len(y), np.nan)
+    for train_idx, test_idx in split_iter:
+        g_tr = groups[train_idx]
+        order = np.argsort(g_tr, kind="stable")  # LGBMRanker needs contiguous query groups
+        X_s = X[train_idx][order]
+        y_s = y[train_idx][order]
+        _, sizes = np.unique(g_tr[order], return_counts=True)
+
+        rel = np.zeros(len(y_s), dtype=int)
+        i = 0
+        for sz in sizes:
+            block = y_s[i:i + sz]
+            rng = block.max() - block.min()
+            if rng > 0:
+                rel[i:i + sz] = np.round(max_relevance * (block - block.min()) / rng).astype(int)
+            i += sz
+
+        ranker = LGBMRanker(
+            objective="lambdarank", n_estimators=n_estimators, learning_rate=learning_rate,
+            num_leaves=num_leaves, min_child_samples=min_child_samples,
+            random_state=random_state, n_jobs=-1,
+            label_gain=[float(k) for k in range(max_relevance + 1)], verbose=-1,
+        )
+        ranker.fit(X_s, rel, group=list(sizes))
+        y_pred[test_idx] = ranker.predict(X[test_idx])
+
+    pred_df = supervised_df[["task_id", "flow_id", "target_value"]].copy()
+    pred_df["y_pred"] = y_pred
+    return pred_df
+
+
 def global_default_predictions(
     y,
     supervised_df: pd.DataFrame,
@@ -2097,12 +2171,18 @@ def run_recommender_evaluation(
         # else the generic "model") plus the two model-independent baselines.
         pred_frames: dict[str, tuple[pd.DataFrame, str, str]] = {}
         for mname in model_list:
-            model = get_models(random_state=random_state, selected_models=[mname])[mname]
-            mpred = cross_val_flow_predictions(
-                X, y, supervised_df, model,
-                model_name=mname, cv_folds=cv_folds,
-                split_mode=split_mode, random_state=random_state,
-            )
+            if mname == "lambdamart":
+                mpred = lambdamart_flow_predictions(
+                    X, y, supervised_df, cv_folds=cv_folds,
+                    split_mode=split_mode, random_state=random_state,
+                )
+            else:
+                model = get_models(random_state=random_state, selected_models=[mname])[mname]
+                mpred = cross_val_flow_predictions(
+                    X, y, supervised_df, model,
+                    model_name=mname, cv_folds=cv_folds,
+                    split_mode=split_mode, random_state=random_state,
+                )
             label = mname if multi_model else "model"
             pred_frames[label] = (mpred, "model", mname)
 
