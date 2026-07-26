@@ -22,7 +22,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.inspection import permutation_importance
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import GroupKFold, KFold
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit, KFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -2038,6 +2038,8 @@ def run_recommender_evaluation(
     ks: tuple[int, ...] = (1, 3, 5, 10),
     n_random_shuffles: int = 20,
     min_candidates: int = 2,
+    include_knn: bool = False,
+    knn_k: int = 5,
     compute_warm_start: bool = True,
     warm_start_eps: float = 0.01,
     warm_start_max_trials: int | None = None,
@@ -2126,6 +2128,17 @@ def run_recommender_evaluation(
             "baseline", "",
         )
 
+        knn_pred = None
+        if include_knn:
+            knn_pred = knn_task_predictions(
+                supervised_df, dataset["task_meta_cols"], k=knn_k,
+                cv_folds=cv_folds, split_mode=split_mode, random_state=random_state,
+            )
+            method_metrics["knn"] = (
+                ranking_metrics_per_task(knn_pred, ks=ks, min_candidates=min_candidates),
+                "baseline", "",
+            )
+
         for method, (m, role, mcol) in method_metrics.items():
             if m.empty:
                 continue
@@ -2166,6 +2179,10 @@ def run_recommender_evaluation(
                     min_candidates=min_candidates, random_state=random_state,
                 ), "",
             )
+            if knn_pred is not None:
+                ws_curves["knn"] = (
+                    warm_start_curve(knn_pred, max_trials=max_trials, min_candidates=min_candidates), "",
+                )
             for method, (curve, mcol) in ws_curves.items():
                 if curve.empty:
                     continue
@@ -2245,3 +2262,457 @@ def run_recommender_evaluation(
         "trials_to_target": trials_to_target_df,
         "results_dir": results_dir,
     }
+
+
+# ============================================================
+# Recommender explainability (SHAP on the ranker)
+# ============================================================
+#
+# Ranking orders flows by predicted accuracy, so TreeSHAP on the accuracy predictor IS
+# the explanation of the ranker. explain_ranker gives the *global* view (which flow-text
+# tokens and task metafeatures drive predictions) and explain_recommendations gives the
+# *local* view (why a specific top-ranked flow was recommended for a task).
+
+
+def _fit_full_ranker(X, y, model_name: str, random_state: int):
+    model = get_models(random_state=random_state, selected_models=[model_name])[model_name]
+    X_fit = _to_dense_if_sparse(X) if model_name == "hist_gbrt" else X
+    model.fit(X_fit, y)
+    return model
+
+
+def _namespace_of(feature: str) -> str:
+    if feature.startswith("meta::"):
+        return "meta"
+    if feature.startswith("text::emb_"):
+        return "embedding"
+    if feature.startswith("text::"):
+        return "text"
+    return "other"
+
+
+def explain_ranker(
+    flows: dict,
+    tasks_df: pd.DataFrame,
+    evals_df: pd.DataFrame,
+    text_mode: str = "tfidf",
+    use_task_metafeatures: bool = True,
+    agg_mode: str = "max",
+    model_name: str = "extra_trees",
+    shap_background_size: int = 200,
+    shap_eval_size: int = 400,
+    top_n: int = 30,
+    random_state: int = 42,
+    cache_dir: str | Path = DEFAULT_CACHE_DIR,
+    results_dir: str | Path = "results_recommender_shap",
+) -> dict[str, Any]:
+    """Global SHAP explanation of the flow ranker.
+
+    Fits ``model_name`` on the full supervised table and runs TreeSHAP over a sample of
+    rows, then ranks features by mean |SHAP| and splits them into ``text::`` /
+    ``embedding`` / ``meta::`` namespaces. Writes ``global_shap_ranker.csv`` (all features,
+    with signed mean SHAP so you can read direction) and ``namespace_shap_share.csv`` (how
+    much attribution mass each namespace carries) into ``results_dir``.
+
+    Returns a dict with ``global_shap`` (DataFrame), ``namespace_share`` (DataFrame),
+    ``top_text`` / ``top_meta`` (DataFrames), ``expected_value``, ``feature_names``.
+    """
+    results_dir = ensure_dir(results_dir)
+    cache = DiskCache(cache_dir)
+
+    dataset = build_cc18_dataset(
+        flows=flows, tasks_df=tasks_df, evals_df=evals_df, agg_mode=agg_mode,
+        text_mode=text_mode, use_task_metafeatures=use_task_metafeatures, cache=cache,
+    )
+    X, y, feature_names = dataset["X"], dataset["y"], dataset["feature_names"]
+
+    model = _fit_full_ranker(X, y, model_name, random_state)
+
+    rng = np.random.default_rng(random_state)
+    n = X.shape[0]
+    X_dense = np.asarray(_to_dense_if_sparse(X), dtype=np.float64)
+    bg_idx = rng.choice(n, size=min(shap_background_size, n), replace=False)
+    ev_idx = rng.choice(n, size=min(shap_eval_size, n), replace=False)
+
+    explainer = shap.TreeExplainer(
+        model, data=X_dense[bg_idx], feature_perturbation="interventional",
+        model_output="raw", feature_names=feature_names,
+    )
+    shap_values = explainer.shap_values(X_dense[ev_idx], check_additivity=False)
+
+    expected_value = explainer.expected_value
+    expected_value = float(np.ravel(expected_value)[0]) if isinstance(expected_value, np.ndarray) else float(expected_value)
+
+    global_shap = pd.DataFrame(
+        {
+            "feature": feature_names,
+            "namespace": [_namespace_of(f) for f in feature_names],
+            "mean_abs_shap": np.abs(shap_values).mean(axis=0),
+            "signed_mean_shap": shap_values.mean(axis=0),
+        }
+    ).sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
+
+    total = float(global_shap["mean_abs_shap"].sum())
+    namespace_share = (
+        global_shap.groupby("namespace", as_index=False)["mean_abs_shap"].sum()
+        .assign(share=lambda d: d["mean_abs_shap"] / total if total > 0 else np.nan)
+        .sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
+    )
+
+    top_text = global_shap[global_shap["namespace"].isin(["text", "embedding"])].head(top_n).reset_index(drop=True)
+    top_meta = global_shap[global_shap["namespace"] == "meta"].head(top_n).reset_index(drop=True)
+
+    global_shap.to_csv(results_dir / "global_shap_ranker.csv", index=False)
+    namespace_share.to_csv(results_dir / "namespace_shap_share.csv", index=False)
+
+    return {
+        "global_shap": global_shap,
+        "namespace_share": namespace_share,
+        "top_text": top_text,
+        "top_meta": top_meta,
+        "expected_value": expected_value,
+        "feature_names": feature_names,
+        "results_dir": results_dir,
+    }
+
+
+# ============================================================
+# Confidence-aware recommendation (conformal prediction)
+# ============================================================
+#
+# Point predictions become recommendations we act on, so they need calibrated intervals.
+# We use group split-conformal: inside each leave-tasks-out fold, hold out a disjoint set
+# of *training tasks* as a calibration set, take the (1 - alpha) quantile of absolute
+# calibration residuals as the half-width q, and emit [pred - q, pred + q]. Grouping the
+# calibration by task keeps coverage honest for the "new task" setting. The interval width
+# then drives *selective recommendation*: abstain on the least-confident tasks and check
+# whether regret drops on the ones we keep.
+
+
+def conformal_flow_predictions(
+    X,
+    y,
+    supervised_df: pd.DataFrame,
+    model,
+    model_name: str = "",
+    cv_folds: int = 5,
+    split_mode: str = "task_group_kfold",
+    alpha: float = 0.1,
+    calib_frac: float = 0.25,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Out-of-fold predictions with split-conformal intervals at level ``1 - alpha``.
+
+    For each leave-tasks-out fold, the training rows are split by task into a proper-train
+    set and a calibration set (``calib_frac`` of the training *tasks*). The model is fit on
+    proper-train; the conformal half-width ``q`` is the ``ceil((m+1)(1-alpha))/m`` quantile
+    of absolute calibration residuals. Returns ``supervised_df[["task_id","flow_id",
+    "target_value"]]`` plus ``y_pred``, ``lo``, ``hi``, ``width``.
+    """
+    groups = supervised_df["task_id"].to_numpy()
+    splitter = _get_splitter(split_mode, n_splits=cv_folds, random_state=random_state)
+    split_iter = (
+        splitter.split(X, y, groups=groups)
+        if split_mode == "task_group_kfold"
+        else splitter.split(X, y)
+    )
+    gss = GroupShuffleSplit(n_splits=1, test_size=calib_frac, random_state=random_state)
+
+    n = len(y)
+    y_pred = np.full(n, np.nan)
+    lo = np.full(n, np.nan)
+    hi = np.full(n, np.nan)
+
+    for train_idx, test_idx in split_iter:
+        g_tr = groups[train_idx]
+        pt_rel, cal_rel = next(gss.split(train_idx, groups=g_tr))
+        pt, cal = train_idx[pt_rel], train_idx[cal_rel]
+
+        X_pt, X_cal, X_te = X[pt], X[cal], X[test_idx]
+        if model_name == "hist_gbrt":
+            X_pt, X_cal, X_te = (_to_dense_if_sparse(a) for a in (X_pt, X_cal, X_te))
+
+        model.fit(X_pt, y[pt])
+        resid = np.abs(y[cal] - model.predict(X_cal))
+        m = len(resid)
+        level = min(1.0, np.ceil((m + 1) * (1 - alpha)) / m)
+        q = float(np.quantile(resid, level, method="higher"))
+
+        pred = model.predict(X_te)
+        y_pred[test_idx] = pred
+        lo[test_idx] = pred - q
+        hi[test_idx] = pred + q
+
+    out = supervised_df[["task_id", "flow_id", "target_value"]].copy()
+    out["y_pred"] = y_pred
+    out["lo"] = lo
+    out["hi"] = hi
+    out["width"] = hi - lo
+    return out
+
+
+def conformal_coverage(pred_df: pd.DataFrame) -> dict[str, float]:
+    """Empirical marginal coverage and mean interval width of conformal predictions."""
+    d = pred_df.dropna(subset=["y_pred", "target_value", "lo", "hi"])
+    covered = ((d["target_value"] >= d["lo"]) & (d["target_value"] <= d["hi"])).mean()
+    return {
+        "coverage": float(covered),
+        "mean_width": float(d["width"].mean()),
+        "n": int(len(d)),
+    }
+
+
+def selective_recommendation_curve(
+    pred_df: pd.DataFrame,
+    fractions: tuple[float, ...] = (0.2, 0.4, 0.6, 0.8, 1.0),
+    min_candidates: int = 2,
+) -> pd.DataFrame:
+    """Regret vs abstention: keep only the most-confident tasks and measure regret@1.
+
+    Task confidence is the mean conformal interval width over the task's candidate flows
+    (narrower = more confident). Tasks are sorted most-confident first; for each retained
+    fraction we report mean ``nregret@1`` on the kept tasks vs the overall mean. If
+    confidence is informative, the selective curve dips below the overall line at small
+    fractions.
+    """
+    rank = ranking_metrics_per_task(pred_df, ks=(1,), min_candidates=min_candidates)
+    conf = (
+        pred_df.dropna(subset=["width"]).groupby("task_id")["width"].mean().rename("mean_width")
+    )
+    m = rank.merge(conf, on="task_id", how="left").dropna(subset=["mean_width"])
+    m = m.sort_values("mean_width").reset_index(drop=True)
+    overall = float(m["nregret@1"].mean())
+
+    rows = []
+    n = len(m)
+    for f in fractions:
+        k = max(1, int(round(f * n)))
+        sel = m.head(k)
+        rows.append(
+            {
+                "retained_frac": f,
+                "n_tasks": k,
+                "nregret@1_selective": float(sel["nregret@1"].mean()),
+                "nregret@1_overall": overall,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def run_conformal_evaluation(
+    flows: dict,
+    tasks_df: pd.DataFrame,
+    evals_df: pd.DataFrame,
+    configs: list[dict[str, Any]],
+    agg_mode: str = "max",
+    model_name: str = "extra_trees",
+    cv_folds: int = 5,
+    alpha: float = 0.1,
+    calib_frac: float = 0.25,
+    random_state: int = 42,
+    cache_dir: str | Path = DEFAULT_CACHE_DIR,
+    results_dir: str | Path = "results_recommender_conformal",
+) -> dict[str, Any]:
+    """Conformal coverage + selective-recommendation curves per config.
+
+    Writes ``conformal_coverage.csv`` and ``selective_recommendation.csv`` into
+    ``results_dir`` and returns them along with the per-config conformal prediction frames.
+    """
+    results_dir = ensure_dir(results_dir)
+    cache = DiskCache(cache_dir)
+
+    cov_rows = []
+    sel_frames = []
+    pred_frames = {}
+
+    for cfg in configs:
+        print(f"Conformal :: {cfg['name']} ({model_name}, alpha={alpha}) ...")
+        dataset = build_cc18_dataset(
+            flows=flows, tasks_df=tasks_df, evals_df=evals_df, agg_mode=agg_mode,
+            text_mode=cfg["text_mode"], use_task_metafeatures=cfg["use_task_metafeatures"],
+            cache=cache,
+        )
+        model = get_models(random_state=random_state, selected_models=[model_name])[model_name]
+        pred = conformal_flow_predictions(
+            dataset["X"], dataset["y"], dataset["supervised_df"], model,
+            model_name=model_name, cv_folds=cv_folds, alpha=alpha,
+            calib_frac=calib_frac, random_state=random_state,
+        )
+        pred_frames[cfg["name"]] = pred
+
+        cov = conformal_coverage(pred)
+        cov_rows.append(
+            {
+                "experiment": cfg["name"], "model": model_name,
+                "alpha": alpha, "target_coverage": 1 - alpha, **cov,
+            }
+        )
+
+        sel = selective_recommendation_curve(pred)
+        sel.insert(0, "experiment", cfg["name"])
+        sel.insert(1, "model", model_name)
+        sel_frames.append(sel)
+
+    coverage_df = pd.DataFrame(cov_rows)
+    selective_df = pd.concat(sel_frames, ignore_index=True) if sel_frames else pd.DataFrame()
+    coverage_df.to_csv(results_dir / "conformal_coverage.csv", index=False)
+    selective_df.to_csv(results_dir / "selective_recommendation.csv", index=False)
+
+    return {
+        "coverage": coverage_df,
+        "selective": selective_df,
+        "predictions": pred_frames,
+        "results_dir": results_dir,
+    }
+
+
+# ============================================================
+# recommend() API + kNN meta-learning baseline
+# ============================================================
+#
+# FlowRecommender is the usable capability: fit once, then for a new task's metafeatures
+# rank candidate flows by predicted accuracy. knn_task_predictions is the classic
+# meta-learning baseline to beat -- score each flow by how it did on the k nearest training
+# tasks (by metafeature distance), the auto-sklearn-style "warm start from similar datasets".
+
+
+def _make_numeric_pipeline():
+    return Pipeline(
+        [
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler(with_mean=False)),
+        ]
+    )
+
+
+class FlowRecommender:
+    """Fit a flow ranker once, then recommend top-k flows for a new task.
+
+    ``fit`` builds the supervised dataset, fits the model on all rows, and stores the
+    fitted TF-IDF vectorizer + numeric metafeature pipeline so features for arbitrary new
+    (task, flow) pairs are built identically to training. ``recommend`` takes a new task's
+    metafeatures (a dict/Series keyed by the metafeature names) and returns the candidate
+    flows ranked by predicted accuracy. Supports ``text_mode`` ``"tfidf"`` / ``"none"``.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "extra_trees",
+        text_mode: str = "tfidf",
+        use_task_metafeatures: bool = True,
+        random_state: int = 42,
+    ) -> None:
+        if text_mode not in ("tfidf", "none"):
+            raise ValueError("FlowRecommender supports text_mode 'tfidf' or 'none'.")
+        self.model_name = model_name
+        self.text_mode = text_mode
+        self.use_task_metafeatures = use_task_metafeatures
+        self.random_state = random_state
+
+    def fit(self, flows, tasks_df, evals_df, agg_mode: str = "max", cache: DiskCache | None = None):
+        dataset = build_cc18_dataset(
+            flows=flows, tasks_df=tasks_df, evals_df=evals_df, agg_mode=agg_mode,
+            text_mode=self.text_mode, use_task_metafeatures=self.use_task_metafeatures,
+            cache=cache,
+        )
+        supervised_df = dataset["supervised_df"]
+        self.feature_names_ = dataset["feature_names"]
+        self.task_meta_cols_ = dataset["task_meta_cols"]
+        self.model_ = _fit_full_ranker(dataset["X"], dataset["y"], self.model_name, self.random_state)
+
+        self.text_vectorizer_ = (
+            dataset["feature_artifacts"].get("text_artifact") if self.text_mode == "tfidf" else None
+        )
+        if self.use_task_metafeatures:
+            self.numeric_pipe_ = _make_numeric_pipeline().fit(supervised_df[self.task_meta_cols_])
+        else:
+            self.numeric_pipe_ = None
+
+        self.flow_pool_ = (
+            supervised_df[["flow_id", "flow_name", "flow_text_clean"]]
+            .drop_duplicates("flow_id").reset_index(drop=True)
+        )
+        return self
+
+    def _features_for(self, flow_texts: pd.Series, task_metafeatures) -> sparse.csr_matrix:
+        parts = []
+        if self.text_mode == "tfidf":
+            parts.append(self.text_vectorizer_.transform(clean_text_series(flow_texts)))
+        if self.use_task_metafeatures:
+            row = {c: (task_metafeatures.get(c) if hasattr(task_metafeatures, "get") else None)
+                   for c in self.task_meta_cols_}
+            meta_df = pd.DataFrame([row] * len(flow_texts), columns=self.task_meta_cols_)
+            X_meta = self.numeric_pipe_.transform(meta_df)
+            if not sparse.issparse(X_meta):
+                X_meta = sparse.csr_matrix(X_meta)
+            parts.append(X_meta)
+        if not parts:
+            raise ValueError("No features configured.")
+        return sparse.hstack(parts).tocsr()
+
+    def recommend(self, task_metafeatures, candidate_flow_ids=None, top_k: int = 10) -> pd.DataFrame:
+        """Return candidate flows ranked by predicted accuracy for ``task_metafeatures``."""
+        pool = self.flow_pool_
+        if candidate_flow_ids is not None:
+            pool = pool[pool["flow_id"].isin(set(candidate_flow_ids))].reset_index(drop=True)
+        if pool.empty:
+            return pool.assign(predicted_accuracy=[])
+        X_new = self._features_for(pool["flow_text_clean"], task_metafeatures)
+        if self.model_name == "hist_gbrt":
+            X_new = _to_dense_if_sparse(X_new)
+        preds = self.model_.predict(X_new)
+        out = pool[["flow_id", "flow_name"]].copy()
+        out["predicted_accuracy"] = preds
+        return out.sort_values("predicted_accuracy", ascending=False).head(top_k).reset_index(drop=True)
+
+
+def knn_task_predictions(
+    supervised_df: pd.DataFrame,
+    task_meta_cols: list[str],
+    k: int = 5,
+    cv_folds: int = 5,
+    split_mode: str = "task_group_kfold",
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """kNN meta-learning baseline: score flows by their accuracy on the k nearest tasks.
+
+    Under the same leave-tasks-out split, each held-out task's candidate flows are scored by
+    the mean accuracy those flows achieved on the ``k`` nearest *training* tasks (Euclidean
+    distance in imputed+standardized metafeature space; scaler fit on training tasks only).
+    Flows unseen among the neighbours fall back to the neighbourhood mean. Returns the same
+    ``y_pred`` shape as :func:`cross_val_flow_predictions` for scoring by
+    :func:`ranking_metrics_per_task`.
+    """
+    tid = supervised_df["task_id"].to_numpy()
+    fid = supervised_df["flow_id"].to_numpy()
+    tgt = supervised_df["target_value"].to_numpy()
+    task_meta = supervised_df.groupby("task_id")[task_meta_cols].first()
+
+    splitter = _get_splitter(split_mode, n_splits=cv_folds, random_state=random_state)
+    split_iter = (
+        splitter.split(np.zeros(len(tid)), tgt, groups=tid)
+        if split_mode == "task_group_kfold"
+        else splitter.split(np.zeros(len(tid)), tgt)
+    )
+
+    y_pred = np.full(len(tid), np.nan)
+    for train_idx, test_idx in split_iter:
+        train_tasks = np.unique(tid[train_idx])
+        imp = SimpleImputer(strategy="median")
+        sc = StandardScaler()
+        M_tr = sc.fit_transform(imp.fit_transform(task_meta.loc[train_tasks]))
+        tr = pd.DataFrame({"flow_id": fid[train_idx], "t": tgt[train_idx], "task_id": tid[train_idx]})
+
+        for tt in np.unique(tid[test_idx]):
+            v = sc.transform(imp.transform(task_meta.loc[[tt]]))
+            dist = np.linalg.norm(M_tr - v, axis=1)
+            nn_tasks = train_tasks[np.argsort(dist)[:k]]
+            neigh = tr[tr["task_id"].isin(nn_tasks)]
+            flow_score = neigh.groupby("flow_id")["t"].mean()
+            gmean = float(neigh["t"].mean()) if len(neigh) else float(tgt[train_idx].mean())
+            rows = test_idx[tid[test_idx] == tt]
+            y_pred[rows] = [float(flow_score.get(f, gmean)) for f in fid[rows]]
+
+    out = supervised_df[["task_id", "flow_id", "target_value"]].copy()
+    out["y_pred"] = y_pred
+    return out
