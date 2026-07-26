@@ -22,3 +22,6 @@ results_cc18_max/
 results_cc18_mean/
 results_cc18_*/
 results_recommender_*/
+
+# New recommender paper draft (kept local)
+paper_recommender/
