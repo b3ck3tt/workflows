@@ -1959,13 +1959,79 @@ def trials_to_target(curve_df: pd.DataFrame, eps_abs: float = 0.01) -> pd.DataFr
     return pd.DataFrame(rows)
 
 
+def paired_ranking_wilcoxon(
+    per_task_df: pd.DataFrame,
+    metric: str = "nregret@1",
+    baseline: str = "global_default",
+    methods: list[str] | None = None,
+    experiments: list[str] | None = None,
+    alternative: str = "two-sided",
+) -> pd.DataFrame:
+    """Paired Wilcoxon signed-rank test of each method vs a baseline, per experiment.
+
+    Tasks are paired by ``task_id`` within an experiment and ``method`` is compared to
+    ``baseline`` on ``metric`` (from :func:`ranking_metrics_per_task` output, as written to
+    ``ranking_metrics_per_task.csv``). Returns one row per (experiment, method) with the
+    signed-rank statistic, p-value, median paired difference (``method - baseline``), and
+    ``win_rate`` -- the fraction of tasks where the method beats the baseline, respecting
+    metric direction (lower is better for regret/nregret, higher for spearman/hit/ndcg).
+    """
+    lower_better = metric.startswith("regret") or metric.startswith("nregret")
+    rows = []
+    exps = experiments or sorted(per_task_df["experiment"].unique())
+    for exp in exps:
+        sub = per_task_df[per_task_df["experiment"] == exp]
+        base = (
+            sub[sub["method"] == baseline][["task_id", metric]]
+            .rename(columns={metric: "_base"})
+        )
+        cand = methods or [m for m in sub["method"].unique() if m != baseline]
+        for method in cand:
+            cur = (
+                sub[sub["method"] == method][["task_id", metric]]
+                .rename(columns={metric: "_cur"})
+            )
+            merged = cur.merge(base, on="task_id", how="inner").dropna()
+            if merged.empty:
+                continue
+            diff = merged["_cur"].to_numpy() - merged["_base"].to_numpy()  # method - baseline
+            n = len(diff)
+            wins = int((diff < 0).sum()) if lower_better else int((diff > 0).sum())
+            if np.any(diff != 0):
+                stat, p = wilcoxon(
+                    merged["_cur"].to_numpy(), merged["_base"].to_numpy(),
+                    zero_method="wilcox", alternative=alternative,
+                )
+                stat, p = float(stat), float(p)
+            else:
+                stat, p = np.nan, np.nan
+            rows.append(
+                {
+                    "experiment": exp,
+                    "method": method,
+                    "baseline": baseline,
+                    "metric": metric,
+                    "n_tasks": n,
+                    "median_diff": float(np.median(diff)),
+                    "win_rate": wins / n,
+                    "statistic": stat,
+                    "p_value": p,
+                }
+            )
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values(["experiment", "metric", "p_value"]).reset_index(drop=True)
+    return out
+
+
 def run_recommender_evaluation(
     flows: dict,
     tasks_df: pd.DataFrame,
     evals_df: pd.DataFrame,
     configs: list[dict[str, Any]],
     agg_mode: str = "max",
-    model_name: str = "hist_gbrt",
+    model_name: str = "extra_trees",
+    model_names: list[str] | None = None,
     cv_folds: int = 5,
     split_mode: str = "task_group_kfold",
     random_state: int = 42,
@@ -1981,14 +2047,20 @@ def run_recommender_evaluation(
     """Evaluate flow recommendation for each named config and write the ranking CSVs.
 
     For every config (``{"name", "text_mode", "use_task_metafeatures"}``) this collects
-    leave-tasks-out predictions with ``model_name`` and scores three methods -- ``model``,
-    ``global_default`` (portfolio baseline), and ``random``.
+    leave-tasks-out predictions and scores each ranker plus two baselines --
+    ``global_default`` (portfolio baseline) and ``random``.
+
+    By default a single model (``model_name``) is used and its rows are labelled
+    ``method="model"``. Pass ``model_names`` (a list) to compare several regressors in one
+    run; then each model's rows are labelled with its name (e.g. ``method="random_forest"``)
+    while the two baselines are computed once per config. A ``role`` column marks each row
+    as ``"model"`` or ``"baseline"``.
 
     Writes ``ranking_metrics_per_task.csv`` (one row per task/method/experiment) and
     ``ranking_metrics.csv`` (means over tasks). When ``compute_warm_start`` is set it also
-    walks each method's ranking as a greedy search and writes ``warm_start_curve.csv``
-    (mean regret vs #trials) and ``warm_start_trials_to_target.csv`` (trials to get within
-    ``warm_start_eps`` accuracy of the best flow, per method).
+    walks each ranking as a greedy search and writes ``warm_start_curve.csv`` (mean regret
+    vs #trials) and ``warm_start_trials_to_target.csv`` (trials to get within
+    ``warm_start_eps`` accuracy of the best flow).
 
     ``agg_mode`` defaults to ``"max"``: ranking "which flow can win on this task" is the
     natural recommendation target.
@@ -1996,13 +2068,16 @@ def run_recommender_evaluation(
     results_dir = ensure_dir(results_dir)
     cache = DiskCache(cache_dir)
 
+    multi_model = model_names is not None
+    model_list = list(model_names) if multi_model else [model_name]
+
     per_task_frames = []
     summary_rows = []
     ws_curve_frames = []
     ws_tt_rows = []
 
     for cfg in configs:
-        print(f"Recommender :: {cfg['name']} ({model_name}, agg={agg_mode}) ...")
+        print(f"Recommender :: {cfg['name']} ({'+'.join(model_list)}, agg={agg_mode}) ...")
         dataset = build_cc18_dataset(
             flows=flows,
             tasks_df=tasks_df,
@@ -2016,40 +2091,56 @@ def run_recommender_evaluation(
         X = dataset["X"]
         y = dataset["y"]
 
-        model = get_models(random_state=random_state, selected_models=[model_name])[model_name]
+        # One prediction frame per model (label = model name when comparing several,
+        # else the generic "model") plus the two model-independent baselines.
+        pred_frames: dict[str, tuple[pd.DataFrame, str, str]] = {}
+        for mname in model_list:
+            model = get_models(random_state=random_state, selected_models=[mname])[mname]
+            mpred = cross_val_flow_predictions(
+                X, y, supervised_df, model,
+                model_name=mname, cv_folds=cv_folds,
+                split_mode=split_mode, random_state=random_state,
+            )
+            label = mname if multi_model else "model"
+            pred_frames[label] = (mpred, "model", mname)
 
-        model_pred = cross_val_flow_predictions(
-            X, y, supervised_df, model,
-            model_name=model_name, cv_folds=cv_folds,
-            split_mode=split_mode, random_state=random_state,
-        )
         gd_pred = global_default_predictions(
             y, supervised_df, cv_folds=cv_folds,
             split_mode=split_mode, random_state=random_state,
         )
+        first_pred = pred_frames[next(iter(pred_frames))][0]
 
         method_metrics = {
-            "model": ranking_metrics_per_task(model_pred, ks=ks, min_candidates=min_candidates),
-            "global_default": ranking_metrics_per_task(gd_pred, ks=ks, min_candidates=min_candidates),
-            "random": random_baseline_metrics(
-                model_pred, ks=ks, n_shuffles=n_random_shuffles,
+            label: (ranking_metrics_per_task(pred, ks=ks, min_candidates=min_candidates), role, mcol)
+            for label, (pred, role, mcol) in pred_frames.items()
+        }
+        method_metrics["global_default"] = (
+            ranking_metrics_per_task(gd_pred, ks=ks, min_candidates=min_candidates),
+            "baseline", "",
+        )
+        method_metrics["random"] = (
+            random_baseline_metrics(
+                first_pred, ks=ks, n_shuffles=n_random_shuffles,
                 min_candidates=min_candidates, random_state=random_state,
             ),
-        }
+            "baseline", "",
+        )
 
-        for method, m in method_metrics.items():
+        for method, (m, role, mcol) in method_metrics.items():
             if m.empty:
                 continue
             m = m.copy()
             m.insert(0, "experiment", cfg["name"])
             m.insert(1, "method", method)
-            m.insert(2, "model", model_name)
+            m.insert(2, "role", role)
+            m.insert(3, "model", mcol)
             per_task_frames.append(m)
 
             srow = {
                 "experiment": cfg["name"],
                 "method": method,
-                "model": model_name,
+                "role": role,
+                "model": mcol,
                 "n_tasks": int(m["task_id"].nunique()),
                 "spearman_mean": float(m["spearman"].mean()),
             }
@@ -2061,20 +2152,21 @@ def run_recommender_evaluation(
             summary_rows.append(srow)
 
         if compute_warm_start:
-            max_trials = warm_start_max_trials or _max_trials_from_preds(model_pred, min_candidates)
+            max_trials = warm_start_max_trials or _max_trials_from_preds(first_pred, min_candidates)
             ws_curves = {
-                "model": warm_start_curve(
-                    model_pred, max_trials=max_trials, min_candidates=min_candidates
-                ),
-                "global_default": warm_start_curve(
-                    gd_pred, max_trials=max_trials, min_candidates=min_candidates
-                ),
-                "random": random_warm_start_curve(
-                    model_pred, n_shuffles=n_random_shuffles, max_trials=max_trials,
-                    min_candidates=min_candidates, random_state=random_state,
-                ),
+                label: (warm_start_curve(pred, max_trials=max_trials, min_candidates=min_candidates), mcol)
+                for label, (pred, _role, mcol) in pred_frames.items()
             }
-            for method, curve in ws_curves.items():
+            ws_curves["global_default"] = (
+                warm_start_curve(gd_pred, max_trials=max_trials, min_candidates=min_candidates), "",
+            )
+            ws_curves["random"] = (
+                random_warm_start_curve(
+                    first_pred, n_shuffles=n_random_shuffles, max_trials=max_trials,
+                    min_candidates=min_candidates, random_state=random_state,
+                ), "",
+            )
+            for method, (curve, mcol) in ws_curves.items():
                 if curve.empty:
                     continue
                 agg = curve.groupby("trial", as_index=False).agg(
@@ -2084,7 +2176,7 @@ def run_recommender_evaluation(
                 )
                 agg.insert(0, "experiment", cfg["name"])
                 agg.insert(1, "method", method)
-                agg.insert(2, "model", model_name)
+                agg.insert(2, "model", mcol)
                 ws_curve_frames.append(agg)
 
                 tt = trials_to_target(curve, eps_abs=warm_start_eps)
@@ -2092,7 +2184,7 @@ def run_recommender_evaluation(
                     {
                         "experiment": cfg["name"],
                         "method": method,
-                        "model": model_name,
+                        "model": mcol,
                         "eps_abs": warm_start_eps,
                         "n_tasks": int(tt["task_id"].nunique()),
                         "trials_to_target_mean": float(tt["trials_to_target"].mean()),
@@ -2111,6 +2203,28 @@ def run_recommender_evaluation(
     per_task_df.to_csv(results_dir / "ranking_metrics_per_task.csv", index=False)
     summary_df.to_csv(results_dir / "ranking_metrics.csv", index=False)
 
+    # Paired significance: each ranker vs each baseline, per experiment.
+    ranking_wilcoxon_df = pd.DataFrame()
+    if not per_task_df.empty:
+        model_methods = [
+            m for m in per_task_df["method"].unique()
+            if m not in ("global_default", "random")
+        ]
+        test_metrics = [
+            c for c in ("nregret@1", "nregret@3", "spearman") if c in per_task_df.columns
+        ]
+        wilcoxon_frames = [
+            paired_ranking_wilcoxon(
+                per_task_df, metric=metric, baseline=base, methods=model_methods
+            )
+            for metric in test_metrics
+            for base in ("global_default", "random")
+        ]
+        wilcoxon_frames = [f for f in wilcoxon_frames if not f.empty]
+        if wilcoxon_frames:
+            ranking_wilcoxon_df = pd.concat(wilcoxon_frames, ignore_index=True)
+            ranking_wilcoxon_df.to_csv(results_dir / "ranking_wilcoxon.csv", index=False)
+
     warm_start_curve_df = (
         pd.concat(ws_curve_frames, ignore_index=True) if ws_curve_frames else pd.DataFrame()
     )
@@ -2126,6 +2240,7 @@ def run_recommender_evaluation(
     return {
         "per_task": per_task_df,
         "summary": summary_df,
+        "wilcoxon": ranking_wilcoxon_df,
         "warm_start_curve": warm_start_curve_df,
         "trials_to_target": trials_to_target_df,
         "results_dir": results_dir,
