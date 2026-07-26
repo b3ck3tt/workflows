@@ -2098,6 +2098,64 @@ def paired_ranking_wilcoxon(
     return out
 
 
+def task_dependence_report(
+    supervised_df: pd.DataFrame,
+    min_shared: int = 3,
+    target_col: str = "target_value",
+) -> dict[str, Any]:
+    """Quantify how task-dependent the optimal flow is (the NFL / heterogeneity measure).
+
+    Low task-dependence means the same flows win everywhere, so a fixed portfolio is near
+    optimal and per-dataset adaptation (metafeatures) has little headroom; high means
+    different tasks need different flows, so data-dependence should pay. Returns:
+
+    - ``cross_task_spearman_mean``/``median``/``n_pairs`` -- agreement between tasks' *true*
+      flow rankings over their shared flows (high => flow quality is task-independent).
+    - ``n_distinct_best_flows``, ``top_best_flow_share``, ``best_flow_entropy`` --
+      concentration of the per-task best flow (concentrated => benign).
+    - ``per_task_best`` -- DataFrame(task_id, best_flow_id, best_value).
+
+    Designed to be run per benchmark so #3 can plot adaptation-value vs heterogeneity as the
+    benchmark union grows.
+    """
+    df = supervised_df[["task_id", "flow_id", target_col]].dropna()
+    idx = df.groupby("task_id")[target_col].idxmax()
+    per_task_best = (
+        df.loc[idx, ["task_id", "flow_id", target_col]]
+        .rename(columns={"flow_id": "best_flow_id", target_col: "best_value"})
+        .reset_index(drop=True)
+    )
+    best_counts = per_task_best["best_flow_id"].value_counts()
+    n_tasks = int(per_task_best["task_id"].nunique())
+    p = (best_counts / best_counts.sum()).to_numpy()
+    entropy = float(-(p * np.log2(p)).sum()) if len(p) else np.nan
+
+    task_vecs = {tid: g.set_index("flow_id")[target_col] for tid, g in df.groupby("task_id")}
+    tids = list(task_vecs)
+    rhos = []
+    for i in range(len(tids)):
+        a = task_vecs[tids[i]]
+        for j in range(i + 1, len(tids)):
+            b = task_vecs[tids[j]]
+            shared = a.index.intersection(b.index)
+            if len(shared) >= min_shared:
+                va, vb = a.loc[shared].to_numpy(), b.loc[shared].to_numpy()
+                if np.std(va) > 0 and np.std(vb) > 0:
+                    rhos.append(float(spearmanr(va, vb).correlation))
+    rhos = np.asarray(rhos, dtype=float)
+
+    return {
+        "n_tasks": n_tasks,
+        "cross_task_spearman_mean": float(np.nanmean(rhos)) if rhos.size else np.nan,
+        "cross_task_spearman_median": float(np.nanmedian(rhos)) if rhos.size else np.nan,
+        "n_pairs": int(rhos.size),
+        "n_distinct_best_flows": int(best_counts.size),
+        "top_best_flow_share": float(best_counts.iloc[0] / n_tasks) if n_tasks else np.nan,
+        "best_flow_entropy": entropy,
+        "per_task_best": per_task_best,
+    }
+
+
 def run_recommender_evaluation(
     flows: dict,
     tasks_df: pd.DataFrame,
