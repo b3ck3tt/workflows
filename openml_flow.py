@@ -152,34 +152,96 @@ def normalize_openml_flows_dict(
     return pd.DataFrame(rows)
 
 
-def normalize_cc18_tasks(tasks_df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
-    df = tasks_df.copy()
+BASIC_META_COLS = [
+    "MajorityClassSize",
+    "MaxNominalAttDistinctValues",
+    "MinorityClassSize",
+    "NumberOfClasses",
+    "NumberOfFeatures",
+    "NumberOfInstances",
+    "NumberOfInstancesWithMissingValues",
+    "NumberOfMissingValues",
+    "NumberOfNumericFeatures",
+    "NumberOfSymbolicFeatures",
+]
 
-    rename_map = {
-        "tid": "task_id",
-        "did": "dataset_id",
-        "name": "task_name",
-    }
-    df = df.rename(columns=rename_map)
+# Substrings identifying landmarker qualities (fast-probe accuracies/error rates) in the
+# OpenML dataset-qualities set -- the high-value metafeatures for algorithm selection.
+LANDMARKER_KEYWORDS = (
+    "Landmark", "ErrRate", "AUC", "kNN", "NaiveBayes",
+    "DecisionStump", "RandomTree", "Node", "J48", "REPTree", "Stump",
+)
 
-    numeric_meta_cols = [
-        "MajorityClassSize",
-        "MaxNominalAttDistinctValues",
-        "MinorityClassSize",
-        "NumberOfClasses",
-        "NumberOfFeatures",
-        "NumberOfInstances",
-        "NumberOfInstancesWithMissingValues",
-        "NumberOfMissingValues",
-        "NumberOfNumericFeatures",
-        "NumberOfSymbolicFeatures",
-    ]
 
-    keep_cols = ["task_id", "dataset_id", "task_name"] + [
-        c for c in numeric_meta_cols if c in df.columns
-    ]
+def load_dataset_qualities(
+    path: str | Path = "minimal_cache_cc18/dataset_qualities.joblib",
+) -> pd.DataFrame:
+    """Load the cached OpenML dataset-qualities table (indexed by ``dataset_id``).
 
-    return df[keep_cols].copy(), [c for c in numeric_meta_cols if c in df.columns]
+    Produced by the qualities fetch script; see :func:`normalize_cc18_tasks` for how the
+    ``metafeature_set`` selection consumes it.
+    """
+    q = joblib.load(path)
+    if q.index.name != "dataset_id" and "dataset_id" in q.columns:
+        q = q.set_index("dataset_id")
+    q.index.name = "dataset_id"
+    return q
+
+
+def normalize_cc18_tasks(
+    tasks_df: pd.DataFrame,
+    metafeature_set: str = "basic",       # "basic" | "openml_full" | "landmarking"
+    qualities: pd.DataFrame | None = None,
+    min_coverage: float = 0.95,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Normalize CC18 task columns and select the numeric metafeature set.
+
+    ``metafeature_set``:
+      - ``"basic"``       -- the 10 hand-picked task qualities already in ``tasks_df``
+        (default; unchanged behavior, needs no ``qualities``).
+      - ``"openml_full"`` -- all numeric OpenML dataset qualities with >= ``min_coverage``
+        non-missing across datasets (requires ``qualities``, from
+        :func:`load_dataset_qualities`).
+      - ``"landmarking"`` -- the well-covered qualities whose names match
+        :data:`LANDMARKER_KEYWORDS` (requires ``qualities``).
+
+    Returns ``(df, numeric_meta_cols)``; the richer columns are merged onto the tasks by
+    ``dataset_id`` and flow into features automatically via :func:`build_feature_set`.
+    """
+    df = tasks_df.copy().rename(columns={"tid": "task_id", "did": "dataset_id", "name": "task_name"})
+
+    if metafeature_set == "basic":
+        cols = [c for c in BASIC_META_COLS if c in df.columns]
+        return df[["task_id", "dataset_id", "task_name"] + cols].copy(), cols
+
+    if metafeature_set not in ("openml_full", "landmarking"):
+        raise ValueError(f"Unsupported metafeature_set: {metafeature_set}")
+    if qualities is None:
+        raise ValueError(
+            f"metafeature_set='{metafeature_set}' requires `qualities` "
+            "(load with load_dataset_qualities())."
+        )
+
+    q = qualities.copy()
+    if q.index.name == "dataset_id":
+        q = q.reset_index()
+    if "dataset_id" not in q.columns:
+        raise ValueError("qualities must have a 'dataset_id' index or column.")
+
+    quality_cols = [c for c in q.columns if c != "dataset_id"]
+    q[quality_cols] = q[quality_cols].apply(pd.to_numeric, errors="coerce")
+    cov = q[quality_cols].notna().mean()
+    good = [c for c in quality_cols if cov[c] >= min_coverage]
+    if metafeature_set == "landmarking":
+        good = [c for c in good if any(k.lower() in c.lower() for k in LANDMARKER_KEYWORDS)]
+    if not good:
+        raise ValueError(f"No qualities passed the filters for metafeature_set='{metafeature_set}'.")
+
+    q["dataset_id"] = pd.to_numeric(q["dataset_id"], errors="coerce").astype("Int64")
+    df["dataset_id"] = pd.to_numeric(df["dataset_id"], errors="coerce").astype("Int64")
+    merged = df.merge(q[["dataset_id"] + good], on="dataset_id", how="left")
+
+    return merged[["task_id", "dataset_id", "task_name"] + good].copy(), good
 
 
 def aggregate_cc18_evaluations(
@@ -1112,6 +1174,8 @@ def build_cc18_dataset(
     agg_mode: str = "mean",                 # "mean" | "max"
     text_mode: str = "tfidf",              # "tfidf" | "minilm" | "none"
     use_task_metafeatures: bool = True,
+    metafeature_set: str = "basic",        # "basic" | "openml_full" | "landmarking"
+    qualities: pd.DataFrame | None = None,
     cache: DiskCache | None = None,
 ) -> dict[str, Any]:
     """Shared front half: raw OpenML frames -> supervised table + feature matrix.
@@ -1127,7 +1191,9 @@ def build_cc18_dataset(
 
     # Normalize
     flows_df = normalize_openml_flows_dict(flows)
-    tasks_norm_df, task_meta_cols = normalize_cc18_tasks(tasks_df)
+    tasks_norm_df, task_meta_cols = normalize_cc18_tasks(
+        tasks_df, metafeature_set=metafeature_set, qualities=qualities
+    )
 
     # Filter to relevant sklearn flows only
     flows_df = filter_relevant_sklearn_flows(flows_df, evals_df)
@@ -2172,6 +2238,8 @@ def run_recommender_evaluation(
     min_candidates: int = 2,
     include_knn: bool = False,
     knn_k: int = 5,
+    metafeature_set: str = "basic",
+    qualities: pd.DataFrame | None = None,
     compute_warm_start: bool = True,
     warm_start_eps: float = 0.01,
     warm_start_max_trials: int | None = None,
@@ -2219,6 +2287,8 @@ def run_recommender_evaluation(
             agg_mode=agg_mode,
             text_mode=cfg["text_mode"],
             use_task_metafeatures=cfg["use_task_metafeatures"],
+            metafeature_set=metafeature_set,
+            qualities=qualities,
             cache=cache,
         )
         supervised_df = dataset["supervised_df"]
