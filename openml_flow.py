@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import shap
 from scipy import sparse
-from scipy.stats import wilcoxon
+from scipy.stats import spearmanr, wilcoxon
 from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor, HistGradientBoostingRegressor
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.impute import SimpleImputer
@@ -1105,31 +1105,25 @@ def load_cc18_from_openml(
 # High-level pipeline
 # ============================================================
 
-def run_cc18_pipeline(
+def build_cc18_dataset(
     flows: dict,
     tasks_df: pd.DataFrame,
     evals_df: pd.DataFrame,
     agg_mode: str = "mean",                 # "mean" | "max"
     text_mode: str = "tfidf",              # "tfidf" | "minilm" | "none"
     use_task_metafeatures: bool = True,
-    run_row_kfold: bool = True,
-    run_task_group_kfold: bool = True,
-    cv_folds: int = 5,
-    random_state: int = 42,
-    selected_models: list[str] | None = None,
-    compute_shap: bool = False,
-    shap_background_size: int = 200,
-    shap_eval_size: int = 100,
-    compute_shap_interactions: bool = False,
-    shap_interaction_eval_size: int = 50,
-    shap_top_k: int = 10,
-    shap_sparsity_mass: float = 0.8,
-    run_name: str | None = None,
-    cache_dir: str | Path = DEFAULT_CACHE_DIR,
-    results_dir: str | Path = DEFAULT_RESULTS_DIR,
+    cache: DiskCache | None = None,
 ) -> dict[str, Any]:
-    cache = DiskCache(cache_dir)
-    results_dir = ensure_dir(results_dir)
+    """Shared front half: raw OpenML frames -> supervised table + feature matrix.
+
+    Runs normalize -> filter (sklearn flows) -> aggregate -> join -> build features,
+    exactly as :func:`run_cc18_pipeline` did inline. Both the CV pipeline and the
+    recommender (:func:`run_recommender_evaluation`) call this so the two share one
+    dataset-construction path. Returns a dict with keys ``supervised_df``, ``X``,
+    ``y``, ``feature_names``, ``feature_artifacts``, ``task_meta_cols``,
+    ``flows_df``, ``tasks_norm_df``, ``evals_agg_df``.
+    """
+    cache = cache or DiskCache()
 
     # Normalize
     flows_df = normalize_openml_flows_dict(flows)
@@ -1160,7 +1154,7 @@ def run_cc18_pipeline(
     )
 
     # Build features
-    X, y, feature_names, artifacts = build_feature_set(
+    X, y, feature_names, feature_artifacts = build_feature_set(
         supervised_df=supervised_df,
         text_mode=text_mode,
         use_task_metafeatures=use_task_metafeatures,
@@ -1168,6 +1162,64 @@ def run_cc18_pipeline(
         target_col="target_value",
         cache=cache,
     )
+
+    return {
+        "supervised_df": supervised_df,
+        "X": X,
+        "y": y,
+        "feature_names": feature_names,
+        "feature_artifacts": feature_artifacts,
+        "task_meta_cols": task_meta_cols,
+        "flows_df": flows_df,
+        "tasks_norm_df": tasks_norm_df,
+        "evals_agg_df": evals_agg_df,
+    }
+
+
+def run_cc18_pipeline(
+    flows: dict,
+    tasks_df: pd.DataFrame,
+    evals_df: pd.DataFrame,
+    agg_mode: str = "mean",                 # "mean" | "max"
+    text_mode: str = "tfidf",              # "tfidf" | "minilm" | "none"
+    use_task_metafeatures: bool = True,
+    run_row_kfold: bool = True,
+    run_task_group_kfold: bool = True,
+    cv_folds: int = 5,
+    random_state: int = 42,
+    selected_models: list[str] | None = None,
+    compute_shap: bool = False,
+    shap_background_size: int = 200,
+    shap_eval_size: int = 100,
+    compute_shap_interactions: bool = False,
+    shap_interaction_eval_size: int = 50,
+    shap_top_k: int = 10,
+    shap_sparsity_mass: float = 0.8,
+    run_name: str | None = None,
+    cache_dir: str | Path = DEFAULT_CACHE_DIR,
+    results_dir: str | Path = DEFAULT_RESULTS_DIR,
+) -> dict[str, Any]:
+    cache = DiskCache(cache_dir)
+    results_dir = ensure_dir(results_dir)
+
+    dataset = build_cc18_dataset(
+        flows=flows,
+        tasks_df=tasks_df,
+        evals_df=evals_df,
+        agg_mode=agg_mode,
+        text_mode=text_mode,
+        use_task_metafeatures=use_task_metafeatures,
+        cache=cache,
+    )
+    supervised_df = dataset["supervised_df"]
+    X = dataset["X"]
+    y = dataset["y"]
+    feature_names = dataset["feature_names"]
+    artifacts = dataset["feature_artifacts"]
+    task_meta_cols = dataset["task_meta_cols"]
+    flows_df = dataset["flows_df"]
+    tasks_norm_df = dataset["tasks_norm_df"]
+    evals_agg_df = dataset["evals_agg_df"]
 
     models = get_models(random_state=random_state, selected_models=selected_models)
 
@@ -1589,4 +1641,492 @@ def consolidate_experiments(
         "anchor": anchor_df,
         "shap_summary": shap_summary_df,
         "local_summary": local_summary_df,
+    }
+
+
+# ============================================================
+# Recommender / ranking evaluation
+# ============================================================
+#
+# The CV pipeline above scores accuracy *predictions* with regression metrics
+# (r2/mae/mse) pooled over all rows. The recommender reframes the same model as a
+# per-task flow *ranker*: for a held-out task, rank every candidate flow by the
+# model's predicted accuracy and ask how good the recommended flow(s) are. This is
+# leave-tasks-out by construction (GroupKFold on task_id), so a task's flows are
+# always ranked by a model that never saw that task.
+#
+# The (task, flow) matrix is sparse -- a flow only has ground-truth accuracy on the
+# tasks where it was actually evaluated. So the candidate set for a held-out task is
+# "flows with a known target_value on that task", and regret is measured against the
+# best true accuracy *within that set*.
+#
+# Baselines: (1) random ordering, and (2) the "global-default" portfolio -- rank
+# flows by their mean training-task accuracy (the flow that is best on average).
+# Beating the global default is the real recommender claim.
+#
+# Warm-start "trials-to-best" curves are a planned second pass built on the same
+# per-task predictions collected here (see cross_val_flow_predictions).
+
+
+def cross_val_flow_predictions(
+    X,
+    y,
+    supervised_df: pd.DataFrame,
+    model,
+    model_name: str = "",
+    cv_folds: int = 5,
+    split_mode: str = "task_group_kfold",
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Collect out-of-fold accuracy predictions, one per (task, flow) row.
+
+    Returns ``supervised_df[["task_id", "flow_id", "target_value"]]`` with an added
+    ``y_pred`` column holding the held-out prediction for that row. Uses GroupKFold on
+    ``task_id`` for ``task_group_kfold`` so every row of a task is predicted by a model
+    trained without that task (the honest leave-tasks-out protocol). ``hist_gbrt`` is
+    densified per fold, mirroring :func:`evaluate_model_cv`.
+    """
+    groups = supervised_df["task_id"].values
+    splitter = _get_splitter(split_mode, n_splits=cv_folds, random_state=random_state)
+    if split_mode == "task_group_kfold":
+        split_iter = splitter.split(X, y, groups=groups)
+    else:
+        split_iter = splitter.split(X, y)
+
+    y_pred = np.full(len(y), np.nan, dtype=float)
+    for train_idx, test_idx in split_iter:
+        X_train = X[train_idx]
+        X_test = X[test_idx]
+        if model_name == "hist_gbrt":
+            X_train = _to_dense_if_sparse(X_train)
+            X_test = _to_dense_if_sparse(X_test)
+        model.fit(X_train, y[train_idx])
+        y_pred[test_idx] = model.predict(X_test)
+
+    pred_df = supervised_df[["task_id", "flow_id", "target_value"]].copy()
+    pred_df["y_pred"] = y_pred
+    return pred_df
+
+
+def global_default_predictions(
+    y,
+    supervised_df: pd.DataFrame,
+    cv_folds: int = 5,
+    split_mode: str = "task_group_kfold",
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Portfolio baseline: score each flow by its mean accuracy on the training tasks.
+
+    Uses the same GroupKFold split as :func:`cross_val_flow_predictions`, so a flow's
+    "average accuracy" score for a held-out task excludes that task's fold (no leakage).
+    Flows unseen in a training fold fall back to the fold's global mean. Returns the same
+    shape as :func:`cross_val_flow_predictions` (a ``y_pred`` column) so it can be scored
+    by :func:`ranking_metrics_per_task` identically.
+    """
+    groups = supervised_df["task_id"].values
+    flow_ids = supervised_df["flow_id"].values
+    target = supervised_df["target_value"].values
+    splitter = _get_splitter(split_mode, n_splits=cv_folds, random_state=random_state)
+    if split_mode == "task_group_kfold":
+        split_iter = splitter.split(np.zeros(len(y)), y, groups=groups)
+    else:
+        split_iter = splitter.split(np.zeros(len(y)), y)
+
+    y_pred = np.full(len(y), np.nan, dtype=float)
+    for train_idx, test_idx in split_iter:
+        tr = pd.DataFrame({"flow_id": flow_ids[train_idx], "t": target[train_idx]})
+        flow_means = tr.groupby("flow_id")["t"].mean()
+        global_mean = float(target[train_idx].mean())
+        y_pred[test_idx] = [
+            float(flow_means.get(f, global_mean)) for f in flow_ids[test_idx]
+        ]
+
+    pred_df = supervised_df[["task_id", "flow_id", "target_value"]].copy()
+    pred_df["y_pred"] = y_pred
+    return pred_df
+
+
+def _dcg_at_k(gains: np.ndarray, k: int) -> float:
+    gains = np.asarray(gains, dtype=float)[:k]
+    if gains.size == 0:
+        return 0.0
+    discounts = 1.0 / np.log2(np.arange(2, gains.size + 2))
+    return float(np.sum(gains * discounts))
+
+
+def ranking_metrics_per_task(
+    pred_df: pd.DataFrame,
+    ks: tuple[int, ...] = (1, 3, 5, 10),
+    min_candidates: int = 2,
+) -> pd.DataFrame:
+    """Per-task ranking quality from a ``y_pred`` column produced by the functions above.
+
+    For each held-out task, flows are ordered by descending ``y_pred`` (ties broken by
+    ``flow_id`` for reproducibility) and compared to the true ``target_value`` ranking:
+
+    - ``regret@k``  -- best true accuracy minus the best accuracy among the top-k
+      predicted flows ("if I only run the k recommended flows, how far below optimal?").
+    - ``nregret@k`` -- ``regret@k`` normalized by the task's accuracy range, so tasks with
+      very different accuracy spreads are comparable in [0, 1].
+    - ``hit@k``     -- 1 if the truly-best flow is within the top-k predicted, else 0.
+    - ``ndcg@k``    -- NDCG using per-task min-max-normalized accuracy as graded relevance
+      (raw accuracies cluster near 1.0 and make plain NDCG uninformative).
+    - ``spearman``  -- rank correlation of predicted vs true accuracy over all candidates.
+
+    Tasks with fewer than ``min_candidates`` scored flows are skipped.
+    """
+    rows = []
+    for task_id, g in pred_df.groupby("task_id"):
+        g = g.dropna(subset=["y_pred", "target_value"])
+        n = len(g)
+        if n < min_candidates:
+            continue
+
+        order = g.sort_values(["y_pred", "flow_id"], ascending=[False, True])
+        true_in_pred_order = order["target_value"].to_numpy()
+        true = g["target_value"].to_numpy()
+        pred = g["y_pred"].to_numpy()
+
+        best = float(true.max())
+        worst = float(true.min())
+        acc_range = best - worst
+
+        if acc_range > 0:
+            rel_pred_order = (true_in_pred_order - worst) / acc_range
+            rel_ideal = np.sort(rel_pred_order)[::-1]
+        else:
+            rel_pred_order = np.zeros_like(true_in_pred_order)
+            rel_ideal = rel_pred_order
+
+        # spearmanr warns and returns NaN on a constant input. Note: with meta-only
+        # features every flow on a task shares the same feature vector, so the model
+        # predicts a constant and cannot rank within-task -- a real property, not a bug.
+        if n >= 3 and np.std(pred) > 0 and np.std(true) > 0:
+            rho = float(spearmanr(pred, true).correlation)
+        else:
+            rho = np.nan
+        best_flow = g.loc[g["target_value"].idxmax(), "flow_id"]
+        ordered_flows = order["flow_id"].to_numpy()
+
+        row = {
+            "task_id": task_id,
+            "n_candidates": n,
+            "best_true": best,
+            "acc_range": acc_range,
+            "spearman": rho,
+        }
+        for k in ks:
+            kk = min(k, n)
+            picked = float(true_in_pred_order[:kk].max())
+            row[f"regret@{k}"] = best - picked
+            row[f"nregret@{k}"] = (best - picked) / acc_range if acc_range > 0 else 0.0
+            row[f"hit@{k}"] = int(best_flow in set(ordered_flows[:kk]))
+            idcg = _dcg_at_k(rel_ideal, k)
+            row[f"ndcg@{k}"] = (
+                _dcg_at_k(rel_pred_order, k) / idcg if idcg > 0 else np.nan
+            )
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def random_baseline_metrics(
+    pred_df: pd.DataFrame,
+    ks: tuple[int, ...] = (1, 3, 5, 10),
+    n_shuffles: int = 20,
+    min_candidates: int = 2,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Expected ranking metrics under random flow ordering, averaged over ``n_shuffles``.
+
+    Reuses :func:`ranking_metrics_per_task` on random ``y_pred`` draws and averages the
+    numeric metrics per task, giving each task the same rows/columns as the model and
+    global-default methods.
+    """
+    rng = np.random.default_rng(random_state)
+    frames = []
+    for _ in range(n_shuffles):
+        shuffled = pred_df.copy()
+        shuffled["y_pred"] = rng.random(len(shuffled))
+        frames.append(
+            ranking_metrics_per_task(shuffled, ks=ks, min_candidates=min_candidates)
+        )
+    allm = pd.concat(frames, ignore_index=True)
+    num_cols = [c for c in allm.columns if c != "task_id"]
+    return allm.groupby("task_id", as_index=False)[num_cols].mean()
+
+
+def _max_trials_from_preds(pred_df: pd.DataFrame, min_candidates: int) -> int:
+    counts = pred_df.dropna(subset=["y_pred", "target_value"]).groupby("task_id").size()
+    counts = counts[counts >= min_candidates]
+    return int(counts.max()) if len(counts) else 0
+
+
+def warm_start_curve(
+    pred_df: pd.DataFrame,
+    max_trials: int | None = None,
+    min_candidates: int = 2,
+) -> pd.DataFrame:
+    """Regret-vs-#trials for greedy evaluation of flows in predicted-score order.
+
+    For each held-out task, evaluate candidate flows one at a time in descending
+    ``y_pred`` order and record the best true accuracy found after ``t`` trials. The
+    row ``regret = best_true - best_found_so_far`` is the search regret after ``t``
+    evaluations. Every task is extended to ``max_trials`` (its regret is 0 once all its
+    candidates have been tried), so the caller can average over ``trial`` directly.
+
+    Returns a long DataFrame with columns ``task_id``, ``trial``, ``regret``,
+    ``nregret`` (range-normalized), ``n_candidates``.
+    """
+    if max_trials is None:
+        max_trials = _max_trials_from_preds(pred_df, min_candidates)
+
+    rows = []
+    for task_id, g in pred_df.groupby("task_id"):
+        g = g.dropna(subset=["y_pred", "target_value"])
+        n = len(g)
+        if n < min_candidates:
+            continue
+
+        order = g.sort_values(["y_pred", "flow_id"], ascending=[False, True])
+        true_order = order["target_value"].to_numpy()
+        best = float(true_order.max())
+        acc_range = best - float(true_order.min())
+        best_so_far = np.maximum.accumulate(true_order)  # best true acc after each trial
+
+        for t in range(1, max_trials + 1):
+            idx = min(t, n) - 1  # beyond n, the best flow has already been tried
+            regret = best - float(best_so_far[idx])
+            rows.append(
+                {
+                    "task_id": task_id,
+                    "trial": t,
+                    "regret": regret,
+                    "nregret": regret / acc_range if acc_range > 0 else 0.0,
+                    "n_candidates": n,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def random_warm_start_curve(
+    pred_df: pd.DataFrame,
+    n_shuffles: int = 20,
+    max_trials: int | None = None,
+    min_candidates: int = 2,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Warm-start curve under random flow ordering, averaged over ``n_shuffles`` draws."""
+    if max_trials is None:
+        max_trials = _max_trials_from_preds(pred_df, min_candidates)
+
+    rng = np.random.default_rng(random_state)
+    frames = []
+    for _ in range(n_shuffles):
+        shuffled = pred_df.copy()
+        shuffled["y_pred"] = rng.random(len(shuffled))
+        frames.append(
+            warm_start_curve(shuffled, max_trials=max_trials, min_candidates=min_candidates)
+        )
+    allc = pd.concat(frames, ignore_index=True)
+    return allc.groupby(["task_id", "trial"], as_index=False).agg(
+        regret=("regret", "mean"),
+        nregret=("nregret", "mean"),
+        n_candidates=("n_candidates", "first"),
+    )
+
+
+def trials_to_target(curve_df: pd.DataFrame, eps_abs: float = 0.01) -> pd.DataFrame:
+    """Per-task number of trials to get within ``eps_abs`` accuracy of the best flow.
+
+    Regret is monotonically non-increasing in ``trial``, so this is the first trial at
+    which ``regret <= eps_abs``. If a task never reaches the tolerance within the curve's
+    trial budget, its value is the maximum trial (a right-censored upper bound).
+    """
+    rows = []
+    for task_id, g in curve_df.groupby("task_id"):
+        g = g.sort_values("trial")
+        hit = g[g["regret"] <= eps_abs]
+        t = int(hit["trial"].iloc[0]) if len(hit) else int(g["trial"].max())
+        rows.append(
+            {
+                "task_id": task_id,
+                "trials_to_target": t,
+                "n_candidates": int(g["n_candidates"].iloc[0]),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def run_recommender_evaluation(
+    flows: dict,
+    tasks_df: pd.DataFrame,
+    evals_df: pd.DataFrame,
+    configs: list[dict[str, Any]],
+    agg_mode: str = "max",
+    model_name: str = "hist_gbrt",
+    cv_folds: int = 5,
+    split_mode: str = "task_group_kfold",
+    random_state: int = 42,
+    ks: tuple[int, ...] = (1, 3, 5, 10),
+    n_random_shuffles: int = 20,
+    min_candidates: int = 2,
+    compute_warm_start: bool = True,
+    warm_start_eps: float = 0.01,
+    warm_start_max_trials: int | None = None,
+    cache_dir: str | Path = DEFAULT_CACHE_DIR,
+    results_dir: str | Path = "results_recommender",
+) -> dict[str, Any]:
+    """Evaluate flow recommendation for each named config and write the ranking CSVs.
+
+    For every config (``{"name", "text_mode", "use_task_metafeatures"}``) this collects
+    leave-tasks-out predictions with ``model_name`` and scores three methods -- ``model``,
+    ``global_default`` (portfolio baseline), and ``random``.
+
+    Writes ``ranking_metrics_per_task.csv`` (one row per task/method/experiment) and
+    ``ranking_metrics.csv`` (means over tasks). When ``compute_warm_start`` is set it also
+    walks each method's ranking as a greedy search and writes ``warm_start_curve.csv``
+    (mean regret vs #trials) and ``warm_start_trials_to_target.csv`` (trials to get within
+    ``warm_start_eps`` accuracy of the best flow, per method).
+
+    ``agg_mode`` defaults to ``"max"``: ranking "which flow can win on this task" is the
+    natural recommendation target.
+    """
+    results_dir = ensure_dir(results_dir)
+    cache = DiskCache(cache_dir)
+
+    per_task_frames = []
+    summary_rows = []
+    ws_curve_frames = []
+    ws_tt_rows = []
+
+    for cfg in configs:
+        print(f"Recommender :: {cfg['name']} ({model_name}, agg={agg_mode}) ...")
+        dataset = build_cc18_dataset(
+            flows=flows,
+            tasks_df=tasks_df,
+            evals_df=evals_df,
+            agg_mode=agg_mode,
+            text_mode=cfg["text_mode"],
+            use_task_metafeatures=cfg["use_task_metafeatures"],
+            cache=cache,
+        )
+        supervised_df = dataset["supervised_df"]
+        X = dataset["X"]
+        y = dataset["y"]
+
+        model = get_models(random_state=random_state, selected_models=[model_name])[model_name]
+
+        model_pred = cross_val_flow_predictions(
+            X, y, supervised_df, model,
+            model_name=model_name, cv_folds=cv_folds,
+            split_mode=split_mode, random_state=random_state,
+        )
+        gd_pred = global_default_predictions(
+            y, supervised_df, cv_folds=cv_folds,
+            split_mode=split_mode, random_state=random_state,
+        )
+
+        method_metrics = {
+            "model": ranking_metrics_per_task(model_pred, ks=ks, min_candidates=min_candidates),
+            "global_default": ranking_metrics_per_task(gd_pred, ks=ks, min_candidates=min_candidates),
+            "random": random_baseline_metrics(
+                model_pred, ks=ks, n_shuffles=n_random_shuffles,
+                min_candidates=min_candidates, random_state=random_state,
+            ),
+        }
+
+        for method, m in method_metrics.items():
+            if m.empty:
+                continue
+            m = m.copy()
+            m.insert(0, "experiment", cfg["name"])
+            m.insert(1, "method", method)
+            m.insert(2, "model", model_name)
+            per_task_frames.append(m)
+
+            srow = {
+                "experiment": cfg["name"],
+                "method": method,
+                "model": model_name,
+                "n_tasks": int(m["task_id"].nunique()),
+                "spearman_mean": float(m["spearman"].mean()),
+            }
+            for k in ks:
+                srow[f"regret@{k}_mean"] = float(m[f"regret@{k}"].mean())
+                srow[f"nregret@{k}_mean"] = float(m[f"nregret@{k}"].mean())
+                srow[f"hit@{k}_mean"] = float(m[f"hit@{k}"].mean())
+                srow[f"ndcg@{k}_mean"] = float(m[f"ndcg@{k}"].mean())
+            summary_rows.append(srow)
+
+        if compute_warm_start:
+            max_trials = warm_start_max_trials or _max_trials_from_preds(model_pred, min_candidates)
+            ws_curves = {
+                "model": warm_start_curve(
+                    model_pred, max_trials=max_trials, min_candidates=min_candidates
+                ),
+                "global_default": warm_start_curve(
+                    gd_pred, max_trials=max_trials, min_candidates=min_candidates
+                ),
+                "random": random_warm_start_curve(
+                    model_pred, n_shuffles=n_random_shuffles, max_trials=max_trials,
+                    min_candidates=min_candidates, random_state=random_state,
+                ),
+            }
+            for method, curve in ws_curves.items():
+                if curve.empty:
+                    continue
+                agg = curve.groupby("trial", as_index=False).agg(
+                    regret_mean=("regret", "mean"),
+                    nregret_mean=("nregret", "mean"),
+                    n_tasks=("task_id", "nunique"),
+                )
+                agg.insert(0, "experiment", cfg["name"])
+                agg.insert(1, "method", method)
+                agg.insert(2, "model", model_name)
+                ws_curve_frames.append(agg)
+
+                tt = trials_to_target(curve, eps_abs=warm_start_eps)
+                ws_tt_rows.append(
+                    {
+                        "experiment": cfg["name"],
+                        "method": method,
+                        "model": model_name,
+                        "eps_abs": warm_start_eps,
+                        "n_tasks": int(tt["task_id"].nunique()),
+                        "trials_to_target_mean": float(tt["trials_to_target"].mean()),
+                        "trials_to_target_median": float(tt["trials_to_target"].median()),
+                        "max_trials": int(max_trials),
+                    }
+                )
+
+    per_task_df = (
+        pd.concat(per_task_frames, ignore_index=True) if per_task_frames else pd.DataFrame()
+    )
+    summary_df = pd.DataFrame(summary_rows)
+    if not summary_df.empty:
+        summary_df = summary_df.sort_values(["experiment", "method"]).reset_index(drop=True)
+
+    per_task_df.to_csv(results_dir / "ranking_metrics_per_task.csv", index=False)
+    summary_df.to_csv(results_dir / "ranking_metrics.csv", index=False)
+
+    warm_start_curve_df = (
+        pd.concat(ws_curve_frames, ignore_index=True) if ws_curve_frames else pd.DataFrame()
+    )
+    trials_to_target_df = pd.DataFrame(ws_tt_rows)
+    if compute_warm_start:
+        warm_start_curve_df.to_csv(results_dir / "warm_start_curve.csv", index=False)
+        if not trials_to_target_df.empty:
+            trials_to_target_df = trials_to_target_df.sort_values(
+                ["experiment", "method"]
+            ).reset_index(drop=True)
+        trials_to_target_df.to_csv(results_dir / "warm_start_trials_to_target.csv", index=False)
+
+    return {
+        "per_task": per_task_df,
+        "summary": summary_df,
+        "warm_start_curve": warm_start_curve_df,
+        "trials_to_target": trials_to_target_df,
+        "results_dir": results_dir,
     }
