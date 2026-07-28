@@ -288,22 +288,45 @@ def aggregate_cc18_evaluations(
     return agg
 
 
+def flow_toolkit(flow_name: str, flow_full_name: str = "") -> str:
+    """Toolkit of a flow = the first dotted segment of its name (sklearn, weka, mlr, ...)."""
+    for s in (flow_name, flow_full_name):
+        if isinstance(s, str) and s:
+            return s.split(".", 1)[0]
+    return "unknown"
+
+
+def filter_relevant_flows(
+    flows_df: pd.DataFrame,
+    evals_df: pd.DataFrame,
+    toolkits: "list[str] | tuple[str, ...] | set[str] | None" = ("sklearn",),
+    flow_id_col: str = "flow_id",
+) -> pd.DataFrame:
+    """Keep flows that appear in evaluations and belong to an allowed toolkit.
+
+    ``toolkits`` is a collection of toolkit prefixes to keep (e.g. ``{"sklearn", "weka"}``);
+    ``None`` keeps every toolkit. Adds a ``toolkit`` column (first dotted segment of the flow
+    name). :func:`filter_relevant_sklearn_flows` is the ``toolkits={"sklearn"}`` special case.
+    """
+    df = flows_df.copy()
+    names = df["flow_name"] if "flow_name" in df.columns else pd.Series("", index=df.index)
+    fulls = df["flow_full_name"] if "flow_full_name" in df.columns else pd.Series("", index=df.index)
+    df["toolkit"] = [flow_toolkit(n, f) for n, f in zip(names.fillna(""), fulls.fillna(""))]
+
+    used = set(pd.to_numeric(evals_df[flow_id_col], errors="coerce").dropna().astype(int).unique())
+    mask = df[flow_id_col].isin(used)
+    if toolkits is not None:
+        mask = mask & df["toolkit"].isin(set(toolkits))
+    return df.loc[mask].reset_index(drop=True)
+
+
 def filter_relevant_sklearn_flows(
     flows_df: pd.DataFrame,
     evals_df: pd.DataFrame,
     flow_id_col: str = "flow_id",
 ) -> pd.DataFrame:
-    used_flow_ids = set(evals_df[flow_id_col].dropna().astype(int).unique())
-
-    mask_used = flows_df[flow_id_col].isin(used_flow_ids)
-
-    mask_sklearn = pd.Series(False, index=flows_df.index)
-    if "flow_name" in flows_df.columns:
-        mask_sklearn = mask_sklearn | flows_df["flow_name"].fillna("").str.startswith("sklearn.")
-    if "flow_full_name" in flows_df.columns:
-        mask_sklearn = mask_sklearn | flows_df["flow_full_name"].fillna("").str.startswith("sklearn.")
-
-    return flows_df.loc[mask_used & mask_sklearn].reset_index(drop=True)
+    """Backward-compatible wrapper: keep only ``sklearn.`` flows used in evaluations."""
+    return filter_relevant_flows(flows_df, evals_df, toolkits={"sklearn"}, flow_id_col=flow_id_col)
 
 
 def build_cc18_supervised_dataset(
@@ -1181,6 +1204,7 @@ def build_cc18_dataset(
     metafeature_set: str = "basic",        # "basic" | "openml_full" | "landmarking"
     qualities: pd.DataFrame | None = None,
     min_coverage: float = 0.95,
+    toolkits: "list[str] | tuple[str, ...] | set[str] | None" = ("sklearn",),
     cache: DiskCache | None = None,
 ) -> dict[str, Any]:
     """Shared front half: raw OpenML frames -> supervised table + feature matrix.
@@ -1201,8 +1225,8 @@ def build_cc18_dataset(
         min_coverage=min_coverage,
     )
 
-    # Filter to relevant sklearn flows only
-    flows_df = filter_relevant_sklearn_flows(flows_df, evals_df)
+    # Filter to relevant flows in the requested toolkit(s)
+    flows_df = filter_relevant_flows(flows_df, evals_df, toolkits=toolkits)
 
     # Aggregate evaluations
     evals_agg_df = aggregate_cc18_evaluations(
@@ -2247,6 +2271,7 @@ def run_recommender_evaluation(
     metafeature_set: str = "basic",
     qualities: pd.DataFrame | None = None,
     min_coverage: float = 0.95,
+    toolkits: "list[str] | tuple[str, ...] | set[str] | None" = ("sklearn",),
     compute_warm_start: bool = True,
     warm_start_eps: float = 0.01,
     warm_start_max_trials: int | None = None,
@@ -2297,6 +2322,7 @@ def run_recommender_evaluation(
             metafeature_set=metafeature_set,
             qualities=qualities,
             min_coverage=min_coverage,
+            toolkits=toolkits,
             cache=cache,
         )
         supervised_df = dataset["supervised_df"]
