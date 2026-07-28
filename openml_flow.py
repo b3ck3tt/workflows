@@ -239,6 +239,10 @@ def normalize_cc18_tasks(
 
     q["dataset_id"] = pd.to_numeric(q["dataset_id"], errors="coerce").astype("Int64")
     df["dataset_id"] = pd.to_numeric(df["dataset_id"], errors="coerce").astype("Int64")
+    # Drop any selected qualities already present on the task frame (e.g. the basic
+    # NumberOf* columns) so the merge doesn't create _x/_y suffixes; the qualities
+    # version wins.
+    df = df.drop(columns=[c for c in good if c in df.columns])
     merged = df.merge(q[["dataset_id"] + good], on="dataset_id", how="left")
 
     return merged[["task_id", "dataset_id", "task_name"] + good].copy(), good
@@ -1176,6 +1180,7 @@ def build_cc18_dataset(
     use_task_metafeatures: bool = True,
     metafeature_set: str = "basic",        # "basic" | "openml_full" | "landmarking"
     qualities: pd.DataFrame | None = None,
+    min_coverage: float = 0.95,
     cache: DiskCache | None = None,
 ) -> dict[str, Any]:
     """Shared front half: raw OpenML frames -> supervised table + feature matrix.
@@ -1192,7 +1197,8 @@ def build_cc18_dataset(
     # Normalize
     flows_df = normalize_openml_flows_dict(flows)
     tasks_norm_df, task_meta_cols = normalize_cc18_tasks(
-        tasks_df, metafeature_set=metafeature_set, qualities=qualities
+        tasks_df, metafeature_set=metafeature_set, qualities=qualities,
+        min_coverage=min_coverage,
     )
 
     # Filter to relevant sklearn flows only
@@ -2240,6 +2246,7 @@ def run_recommender_evaluation(
     knn_k: int = 5,
     metafeature_set: str = "basic",
     qualities: pd.DataFrame | None = None,
+    min_coverage: float = 0.95,
     compute_warm_start: bool = True,
     warm_start_eps: float = 0.01,
     warm_start_max_trials: int | None = None,
@@ -2289,6 +2296,7 @@ def run_recommender_evaluation(
             use_task_metafeatures=cfg["use_task_metafeatures"],
             metafeature_set=metafeature_set,
             qualities=qualities,
+            min_coverage=min_coverage,
             cache=cache,
         )
         supervised_df = dataset["supervised_df"]
