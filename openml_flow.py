@@ -102,6 +102,65 @@ def text_series_hash(series: pd.Series) -> str:
     return hashlib.md5(raw).hexdigest()
 
 
+# LLM-authored semantic lexicon: maps algorithm/component name fragments (as they appear in
+# cleaned flow text, across sklearn / weka / mlr / keras / torch) to a shared concept
+# vocabulary. Enriching flow text with these tokens injects domain knowledge and, crucially,
+# aligns the same algorithm family across toolkits (e.g. sklearn RandomForest, weka
+# RandomForest, mlr ranger all -> "tree_ensemble"), which should help cross-toolkit transfer.
+# Authored by hand (Claude); static and versioned for reproducibility.
+SEMANTIC_LEXICON: list[tuple[tuple[str, ...], str]] = [
+    (("randomforest", "extratrees", "ranger", "baggedtrees", "randomcommittee"),
+     "tree_ensemble bagging decision_trees nonlinear robust_to_scaling"),
+    (("gradientboost", "xgboost", "adaboost", "logitboost", "histgradient", "gbm", "gbrt", "lightgbm"),
+     "boosting gradient_boosting tree_ensemble sequential nonlinear strong_learner"),
+    (("decisiontree", "reptree", "rpart", "randomtree", "j48", "c45", "cart", "hoeffding"),
+     "decision_tree axis_aligned_splits interpretable nonlinear"),
+    (("decisionstump", "zeror", "oner"),
+     "weak_baseline shallow low_capacity"),
+    (("svc", "svm", "smo", "ksvm", "supportvector", "libsvm"),
+     "support_vector_machine margin kernel needs_scaling nonlinear"),
+    (("naivebayes", "nbayes"),
+     "naive_bayes probabilistic generative feature_independence fast"),
+    (("logistic", "linearmodel", "linearsvc", "simplelogistic", "sgdclassifier", "ridge", "glmnet"),
+     "linear_model linear_decision_boundary needs_scaling"),
+    (("kneighbors", "ibk", "kknn", "nearestneighbor"),
+     "nearest_neighbor instance_based distance_based nonparametric needs_scaling"),
+    (("mlp", "multilayerperceptron", "neuralnet", "keras", "torch", "avnnet", "nnet", "conv2d", "dense", "sequential", "mxnet"),
+     "neural_network deep_learning high_capacity nonlinear needs_scaling"),
+    (("discriminant", "lda", "qda"),
+     "discriminant_analysis gaussian linear"),
+    (("jrip", "part", "decisiontable", "randomrules", "conjunctiverule", "ripper"),
+     "rule_based interpretable"),
+    (("impute", "imputer", "missing"),
+     "handles_missing_values imputation"),
+    (("standardscaler", "normaliz", "minmax", "scaler", "robustscaler"),
+     "feature_scaling standardization"),
+    (("onehot", "encoder", "categorical"),
+     "categorical_encoding"),
+    (("pca", "variancethreshold", "dimensionality", "selectkbest", "featureselection", "selectpercentile"),
+     "dimensionality_reduction feature_selection"),
+    (("voting", "stacking", "ensemble", "committee"),
+     "ensemble_meta"),
+]
+
+
+def enrich_flow_text_semantic(cleaned_text: str) -> str:
+    """Append shared-vocabulary concept tokens to already-cleaned flow text.
+
+    Adds domain-knowledge tokens for any algorithm/preprocessing family detected via
+    :data:`SEMANTIC_LEXICON`, so TF-IDF sees the *kind* of pipeline (and aligns it across
+    toolkits), not just toolkit-specific class names. Augments rather than replaces the
+    original text, preserving the exact tokens SHAP found informative.
+    """
+    if not isinstance(cleaned_text, str) or not cleaned_text:
+        return cleaned_text or ""
+    extra = []
+    for fragments, tokens in SEMANTIC_LEXICON:
+        if any(f in cleaned_text for f in fragments):
+            extra.append(tokens)
+    return cleaned_text if not extra else cleaned_text + " " + " ".join(extra)
+
+
 # ============================================================
 # OpenML-specific normalization
 # ============================================================
@@ -454,6 +513,25 @@ def build_feature_set(
 
         def _compute():
             return build_tfidf_features(supervised_df[text_col])
+
+        X_text, text_artifact, text_feature_names = cache.get_or_compute(key, _compute)
+        X_parts.append(X_text)
+        feature_names.extend([f"text::{x}" for x in text_feature_names])
+        artifacts["text_artifact"] = text_artifact
+
+    elif text_mode == "tfidf_enriched":
+        enriched = clean_text_series(supervised_df[text_col]).map(enrich_flow_text_semantic)
+        key = make_cache_key(
+            "tfidf_enriched_features",
+            {
+                "n": len(supervised_df),
+                "text_col": text_col,
+                "text_hash": hashlib.md5("\n".join(enriched.tolist()).encode("utf-8")).hexdigest(),
+            },
+        )
+
+        def _compute():
+            return build_tfidf_features(enriched)
 
         X_text, text_artifact, text_feature_names = cache.get_or_compute(key, _compute)
         X_parts.append(X_text)
