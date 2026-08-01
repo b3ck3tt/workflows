@@ -25,3 +25,6 @@ results_recommender_*/
 
 # New recommender paper draft (kept local)
 paper_recommender/
+
+# Local scratch dir/symlink for recommender_experiments intermediates
+scratch

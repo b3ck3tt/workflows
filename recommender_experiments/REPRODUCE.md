@@ -12,7 +12,8 @@ pip install -r ../requirements.txt          # + lightgbm, optuna, shap, statsmod
 ```
 - Run every script **from the repo root** (paths are relative: `scratch/…` for intermediates,
   `minimal_cache_cc18/…` for the OpenML disk cache, `results_recommender_*/` for per-run outputs).
-- Set `RECSCRATCH` if you want the scratch dir elsewhere; default is `./scratch` (create it first).
+- Create `./scratch` at the repo root (or `ln -s` it to an existing data dir); scripts read/write their
+  intermediates there and the data-build scripts below seed the OpenML caches.
 - OpenML access: `OPENML_API_KEY` env var (see `configure_openml` in `openml_flow.py`).
 
 **auto-sklearn 2.0 environment** (P3 §4.0b only — needs a legacy stack; on Apple Silicon use osx-64):
