@@ -12,6 +12,9 @@ shap
 # Text embeddings (only needed for text_mode="minilm")
 sentence-transformers
 
+# Learning-to-rank recommender (only needed for model_name="lambdamart")
+lightgbm
+
 # Figures notebook
 seaborn
 matplotlib

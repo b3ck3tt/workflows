@@ -15,14 +15,14 @@ import numpy as np
 import pandas as pd
 import shap
 from scipy import sparse
-from scipy.stats import wilcoxon
+from scipy.stats import spearmanr, wilcoxon
 from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor, HistGradientBoostingRegressor
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.impute import SimpleImputer
 from sklearn.inspection import permutation_importance
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import GroupKFold, KFold
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit, KFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -102,6 +102,65 @@ def text_series_hash(series: pd.Series) -> str:
     return hashlib.md5(raw).hexdigest()
 
 
+# LLM-authored semantic lexicon: maps algorithm/component name fragments (as they appear in
+# cleaned flow text, across sklearn / weka / mlr / keras / torch) to a shared concept
+# vocabulary. Enriching flow text with these tokens injects domain knowledge and, crucially,
+# aligns the same algorithm family across toolkits (e.g. sklearn RandomForest, weka
+# RandomForest, mlr ranger all -> "tree_ensemble"), which should help cross-toolkit transfer.
+# Authored by hand (Claude); static and versioned for reproducibility.
+SEMANTIC_LEXICON: list[tuple[tuple[str, ...], str]] = [
+    (("randomforest", "extratrees", "ranger", "baggedtrees", "randomcommittee"),
+     "tree_ensemble bagging decision_trees nonlinear robust_to_scaling"),
+    (("gradientboost", "xgboost", "adaboost", "logitboost", "histgradient", "gbm", "gbrt", "lightgbm"),
+     "boosting gradient_boosting tree_ensemble sequential nonlinear strong_learner"),
+    (("decisiontree", "reptree", "rpart", "randomtree", "j48", "c45", "cart", "hoeffding"),
+     "decision_tree axis_aligned_splits interpretable nonlinear"),
+    (("decisionstump", "zeror", "oner"),
+     "weak_baseline shallow low_capacity"),
+    (("svc", "svm", "smo", "ksvm", "supportvector", "libsvm"),
+     "support_vector_machine margin kernel needs_scaling nonlinear"),
+    (("naivebayes", "nbayes"),
+     "naive_bayes probabilistic generative feature_independence fast"),
+    (("logistic", "linearmodel", "linearsvc", "simplelogistic", "sgdclassifier", "ridge", "glmnet"),
+     "linear_model linear_decision_boundary needs_scaling"),
+    (("kneighbors", "ibk", "kknn", "nearestneighbor"),
+     "nearest_neighbor instance_based distance_based nonparametric needs_scaling"),
+    (("mlp", "multilayerperceptron", "neuralnet", "keras", "torch", "avnnet", "nnet", "conv2d", "dense", "sequential", "mxnet"),
+     "neural_network deep_learning high_capacity nonlinear needs_scaling"),
+    (("discriminant", "lda", "qda"),
+     "discriminant_analysis gaussian linear"),
+    (("jrip", "part", "decisiontable", "randomrules", "conjunctiverule", "ripper"),
+     "rule_based interpretable"),
+    (("impute", "imputer", "missing"),
+     "handles_missing_values imputation"),
+    (("standardscaler", "normaliz", "minmax", "scaler", "robustscaler"),
+     "feature_scaling standardization"),
+    (("onehot", "encoder", "categorical"),
+     "categorical_encoding"),
+    (("pca", "variancethreshold", "dimensionality", "selectkbest", "featureselection", "selectpercentile"),
+     "dimensionality_reduction feature_selection"),
+    (("voting", "stacking", "ensemble", "committee"),
+     "ensemble_meta"),
+]
+
+
+def enrich_flow_text_semantic(cleaned_text: str) -> str:
+    """Append shared-vocabulary concept tokens to already-cleaned flow text.
+
+    Adds domain-knowledge tokens for any algorithm/preprocessing family detected via
+    :data:`SEMANTIC_LEXICON`, so TF-IDF sees the *kind* of pipeline (and aligns it across
+    toolkits), not just toolkit-specific class names. Augments rather than replaces the
+    original text, preserving the exact tokens SHAP found informative.
+    """
+    if not isinstance(cleaned_text, str) or not cleaned_text:
+        return cleaned_text or ""
+    extra = []
+    for fragments, tokens in SEMANTIC_LEXICON:
+        if any(f in cleaned_text for f in fragments):
+            extra.append(tokens)
+    return cleaned_text if not extra else cleaned_text + " " + " ".join(extra)
+
+
 # ============================================================
 # OpenML-specific normalization
 # ============================================================
@@ -152,34 +211,100 @@ def normalize_openml_flows_dict(
     return pd.DataFrame(rows)
 
 
-def normalize_cc18_tasks(tasks_df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
-    df = tasks_df.copy()
+BASIC_META_COLS = [
+    "MajorityClassSize",
+    "MaxNominalAttDistinctValues",
+    "MinorityClassSize",
+    "NumberOfClasses",
+    "NumberOfFeatures",
+    "NumberOfInstances",
+    "NumberOfInstancesWithMissingValues",
+    "NumberOfMissingValues",
+    "NumberOfNumericFeatures",
+    "NumberOfSymbolicFeatures",
+]
 
-    rename_map = {
-        "tid": "task_id",
-        "did": "dataset_id",
-        "name": "task_name",
-    }
-    df = df.rename(columns=rename_map)
+# Substrings identifying landmarker qualities (fast-probe accuracies/error rates) in the
+# OpenML dataset-qualities set -- the high-value metafeatures for algorithm selection.
+LANDMARKER_KEYWORDS = (
+    "Landmark", "ErrRate", "AUC", "kNN", "NaiveBayes",
+    "DecisionStump", "RandomTree", "Node", "J48", "REPTree", "Stump",
+)
 
-    numeric_meta_cols = [
-        "MajorityClassSize",
-        "MaxNominalAttDistinctValues",
-        "MinorityClassSize",
-        "NumberOfClasses",
-        "NumberOfFeatures",
-        "NumberOfInstances",
-        "NumberOfInstancesWithMissingValues",
-        "NumberOfMissingValues",
-        "NumberOfNumericFeatures",
-        "NumberOfSymbolicFeatures",
-    ]
 
-    keep_cols = ["task_id", "dataset_id", "task_name"] + [
-        c for c in numeric_meta_cols if c in df.columns
-    ]
+def load_dataset_qualities(
+    path: str | Path = "minimal_cache_cc18/dataset_qualities.joblib",
+) -> pd.DataFrame:
+    """Load the cached OpenML dataset-qualities table (indexed by ``dataset_id``).
 
-    return df[keep_cols].copy(), [c for c in numeric_meta_cols if c in df.columns]
+    Produced by the qualities fetch script; see :func:`normalize_cc18_tasks` for how the
+    ``metafeature_set`` selection consumes it.
+    """
+    q = joblib.load(path)
+    if q.index.name != "dataset_id" and "dataset_id" in q.columns:
+        q = q.set_index("dataset_id")
+    q.index.name = "dataset_id"
+    return q
+
+
+def normalize_cc18_tasks(
+    tasks_df: pd.DataFrame,
+    metafeature_set: str = "basic",       # "basic" | "openml_full" | "landmarking"
+    qualities: pd.DataFrame | None = None,
+    min_coverage: float = 0.95,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Normalize CC18 task columns and select the numeric metafeature set.
+
+    ``metafeature_set``:
+      - ``"basic"``       -- the 10 hand-picked task qualities already in ``tasks_df``
+        (default; unchanged behavior, needs no ``qualities``).
+      - ``"openml_full"`` -- all numeric OpenML dataset qualities with >= ``min_coverage``
+        non-missing across datasets (requires ``qualities``, from
+        :func:`load_dataset_qualities`).
+      - ``"landmarking"`` -- the well-covered qualities whose names match
+        :data:`LANDMARKER_KEYWORDS` (requires ``qualities``).
+
+    Returns ``(df, numeric_meta_cols)``; the richer columns are merged onto the tasks by
+    ``dataset_id`` and flow into features automatically via :func:`build_feature_set`.
+    """
+    df = tasks_df.copy().rename(columns={"tid": "task_id", "did": "dataset_id", "name": "task_name"})
+
+    if metafeature_set == "basic":
+        cols = [c for c in BASIC_META_COLS if c in df.columns]
+        return df[["task_id", "dataset_id", "task_name"] + cols].copy(), cols
+
+    if metafeature_set not in ("openml_full", "landmarking"):
+        raise ValueError(f"Unsupported metafeature_set: {metafeature_set}")
+    if qualities is None:
+        raise ValueError(
+            f"metafeature_set='{metafeature_set}' requires `qualities` "
+            "(load with load_dataset_qualities())."
+        )
+
+    q = qualities.copy()
+    if q.index.name == "dataset_id":
+        q = q.reset_index()
+    if "dataset_id" not in q.columns:
+        raise ValueError("qualities must have a 'dataset_id' index or column.")
+
+    quality_cols = [c for c in q.columns if c != "dataset_id"]
+    q[quality_cols] = q[quality_cols].apply(pd.to_numeric, errors="coerce")
+    cov = q[quality_cols].notna().mean()
+    good = [c for c in quality_cols if cov[c] >= min_coverage]
+    if metafeature_set == "landmarking":
+        good = [c for c in good if any(k.lower() in c.lower() for k in LANDMARKER_KEYWORDS)]
+    if not good:
+        raise ValueError(f"No qualities passed the filters for metafeature_set='{metafeature_set}'.")
+
+    q["dataset_id"] = pd.to_numeric(q["dataset_id"], errors="coerce").astype("Int64")
+    df["dataset_id"] = pd.to_numeric(df["dataset_id"], errors="coerce").astype("Int64")
+    # Drop any selected qualities already present on the task frame (e.g. the basic
+    # NumberOf* columns) so the merge doesn't create _x/_y suffixes; the qualities
+    # version wins.
+    df = df.drop(columns=[c for c in good if c in df.columns])
+    merged = df.merge(q[["dataset_id"] + good], on="dataset_id", how="left")
+
+    return merged[["task_id", "dataset_id", "task_name"] + good].copy(), good
 
 
 def aggregate_cc18_evaluations(
@@ -222,22 +347,45 @@ def aggregate_cc18_evaluations(
     return agg
 
 
+def flow_toolkit(flow_name: str, flow_full_name: str = "") -> str:
+    """Toolkit of a flow = the first dotted segment of its name (sklearn, weka, mlr, ...)."""
+    for s in (flow_name, flow_full_name):
+        if isinstance(s, str) and s:
+            return s.split(".", 1)[0]
+    return "unknown"
+
+
+def filter_relevant_flows(
+    flows_df: pd.DataFrame,
+    evals_df: pd.DataFrame,
+    toolkits: "list[str] | tuple[str, ...] | set[str] | None" = ("sklearn",),
+    flow_id_col: str = "flow_id",
+) -> pd.DataFrame:
+    """Keep flows that appear in evaluations and belong to an allowed toolkit.
+
+    ``toolkits`` is a collection of toolkit prefixes to keep (e.g. ``{"sklearn", "weka"}``);
+    ``None`` keeps every toolkit. Adds a ``toolkit`` column (first dotted segment of the flow
+    name). :func:`filter_relevant_sklearn_flows` is the ``toolkits={"sklearn"}`` special case.
+    """
+    df = flows_df.copy()
+    names = df["flow_name"] if "flow_name" in df.columns else pd.Series("", index=df.index)
+    fulls = df["flow_full_name"] if "flow_full_name" in df.columns else pd.Series("", index=df.index)
+    df["toolkit"] = [flow_toolkit(n, f) for n, f in zip(names.fillna(""), fulls.fillna(""))]
+
+    used = set(pd.to_numeric(evals_df[flow_id_col], errors="coerce").dropna().astype(int).unique())
+    mask = df[flow_id_col].isin(used)
+    if toolkits is not None:
+        mask = mask & df["toolkit"].isin(set(toolkits))
+    return df.loc[mask].reset_index(drop=True)
+
+
 def filter_relevant_sklearn_flows(
     flows_df: pd.DataFrame,
     evals_df: pd.DataFrame,
     flow_id_col: str = "flow_id",
 ) -> pd.DataFrame:
-    used_flow_ids = set(evals_df[flow_id_col].dropna().astype(int).unique())
-
-    mask_used = flows_df[flow_id_col].isin(used_flow_ids)
-
-    mask_sklearn = pd.Series(False, index=flows_df.index)
-    if "flow_name" in flows_df.columns:
-        mask_sklearn = mask_sklearn | flows_df["flow_name"].fillna("").str.startswith("sklearn.")
-    if "flow_full_name" in flows_df.columns:
-        mask_sklearn = mask_sklearn | flows_df["flow_full_name"].fillna("").str.startswith("sklearn.")
-
-    return flows_df.loc[mask_used & mask_sklearn].reset_index(drop=True)
+    """Backward-compatible wrapper: keep only ``sklearn.`` flows used in evaluations."""
+    return filter_relevant_flows(flows_df, evals_df, toolkits={"sklearn"}, flow_id_col=flow_id_col)
 
 
 def build_cc18_supervised_dataset(
@@ -365,6 +513,25 @@ def build_feature_set(
 
         def _compute():
             return build_tfidf_features(supervised_df[text_col])
+
+        X_text, text_artifact, text_feature_names = cache.get_or_compute(key, _compute)
+        X_parts.append(X_text)
+        feature_names.extend([f"text::{x}" for x in text_feature_names])
+        artifacts["text_artifact"] = text_artifact
+
+    elif text_mode == "tfidf_enriched":
+        enriched = clean_text_series(supervised_df[text_col]).map(enrich_flow_text_semantic)
+        key = make_cache_key(
+            "tfidf_enriched_features",
+            {
+                "n": len(supervised_df),
+                "text_col": text_col,
+                "text_hash": hashlib.md5("\n".join(enriched.tolist()).encode("utf-8")).hexdigest(),
+            },
+        )
+
+        def _compute():
+            return build_tfidf_features(enriched)
 
         X_text, text_artifact, text_feature_names = cache.get_or_compute(key, _compute)
         X_parts.append(X_text)
@@ -1105,6 +1272,84 @@ def load_cc18_from_openml(
 # High-level pipeline
 # ============================================================
 
+def build_cc18_dataset(
+    flows: dict,
+    tasks_df: pd.DataFrame,
+    evals_df: pd.DataFrame,
+    agg_mode: str = "mean",                 # "mean" | "max"
+    text_mode: str = "tfidf",              # "tfidf" | "minilm" | "none"
+    use_task_metafeatures: bool = True,
+    metafeature_set: str = "basic",        # "basic" | "openml_full" | "landmarking"
+    qualities: pd.DataFrame | None = None,
+    min_coverage: float = 0.95,
+    toolkits: "list[str] | tuple[str, ...] | set[str] | None" = ("sklearn",),
+    cache: DiskCache | None = None,
+) -> dict[str, Any]:
+    """Shared front half: raw OpenML frames -> supervised table + feature matrix.
+
+    Runs normalize -> filter (sklearn flows) -> aggregate -> join -> build features,
+    exactly as :func:`run_cc18_pipeline` did inline. Both the CV pipeline and the
+    recommender (:func:`run_recommender_evaluation`) call this so the two share one
+    dataset-construction path. Returns a dict with keys ``supervised_df``, ``X``,
+    ``y``, ``feature_names``, ``feature_artifacts``, ``task_meta_cols``,
+    ``flows_df``, ``tasks_norm_df``, ``evals_agg_df``.
+    """
+    cache = cache or DiskCache()
+
+    # Normalize
+    flows_df = normalize_openml_flows_dict(flows)
+    tasks_norm_df, task_meta_cols = normalize_cc18_tasks(
+        tasks_df, metafeature_set=metafeature_set, qualities=qualities,
+        min_coverage=min_coverage,
+    )
+
+    # Filter to relevant flows in the requested toolkit(s)
+    flows_df = filter_relevant_flows(flows_df, evals_df, toolkits=toolkits)
+
+    # Aggregate evaluations
+    evals_agg_df = aggregate_cc18_evaluations(
+        evals_df=evals_df,
+        value_col="value",
+        agg_mode=agg_mode,
+    )
+
+    # Keep only rows with kept flows
+    evals_agg_df = evals_agg_df[
+        evals_agg_df["flow_id"].isin(flows_df["flow_id"])
+    ].reset_index(drop=True)
+
+    # Build supervised table
+    supervised_df = build_cc18_supervised_dataset(
+        flows_df=flows_df,
+        tasks_df=tasks_norm_df,
+        evals_agg_df=evals_agg_df,
+        text_col="flow_text_clean",
+        target_col="target_value",
+    )
+
+    # Build features
+    X, y, feature_names, feature_artifacts = build_feature_set(
+        supervised_df=supervised_df,
+        text_mode=text_mode,
+        use_task_metafeatures=use_task_metafeatures,
+        text_col="flow_text_clean",
+        target_col="target_value",
+        cache=cache,
+    )
+
+    return {
+        "supervised_df": supervised_df,
+        "X": X,
+        "y": y,
+        "feature_names": feature_names,
+        "feature_artifacts": feature_artifacts,
+        "task_meta_cols": task_meta_cols,
+        "flows_df": flows_df,
+        "tasks_norm_df": tasks_norm_df,
+        "evals_agg_df": evals_agg_df,
+    }
+
+
 def run_cc18_pipeline(
     flows: dict,
     tasks_df: pd.DataFrame,
@@ -1131,43 +1376,24 @@ def run_cc18_pipeline(
     cache = DiskCache(cache_dir)
     results_dir = ensure_dir(results_dir)
 
-    # Normalize
-    flows_df = normalize_openml_flows_dict(flows)
-    tasks_norm_df, task_meta_cols = normalize_cc18_tasks(tasks_df)
-
-    # Filter to relevant sklearn flows only
-    flows_df = filter_relevant_sklearn_flows(flows_df, evals_df)
-
-    # Aggregate evaluations
-    evals_agg_df = aggregate_cc18_evaluations(
+    dataset = build_cc18_dataset(
+        flows=flows,
+        tasks_df=tasks_df,
         evals_df=evals_df,
-        value_col="value",
         agg_mode=agg_mode,
-    )
-
-    # Keep only rows with kept flows
-    evals_agg_df = evals_agg_df[
-        evals_agg_df["flow_id"].isin(flows_df["flow_id"])
-    ].reset_index(drop=True)
-
-    # Build supervised table
-    supervised_df = build_cc18_supervised_dataset(
-        flows_df=flows_df,
-        tasks_df=tasks_norm_df,
-        evals_agg_df=evals_agg_df,
-        text_col="flow_text_clean",
-        target_col="target_value",
-    )
-
-    # Build features
-    X, y, feature_names, artifacts = build_feature_set(
-        supervised_df=supervised_df,
         text_mode=text_mode,
         use_task_metafeatures=use_task_metafeatures,
-        text_col="flow_text_clean",
-        target_col="target_value",
         cache=cache,
     )
+    supervised_df = dataset["supervised_df"]
+    X = dataset["X"]
+    y = dataset["y"]
+    feature_names = dataset["feature_names"]
+    artifacts = dataset["feature_artifacts"]
+    task_meta_cols = dataset["task_meta_cols"]
+    flows_df = dataset["flows_df"]
+    tasks_norm_df = dataset["tasks_norm_df"]
+    evals_agg_df = dataset["evals_agg_df"]
 
     models = get_models(random_state=random_state, selected_models=selected_models)
 
@@ -1590,3 +1816,1223 @@ def consolidate_experiments(
         "shap_summary": shap_summary_df,
         "local_summary": local_summary_df,
     }
+
+
+# ============================================================
+# Recommender / ranking evaluation
+# ============================================================
+#
+# The CV pipeline above scores accuracy *predictions* with regression metrics
+# (r2/mae/mse) pooled over all rows. The recommender reframes the same model as a
+# per-task flow *ranker*: for a held-out task, rank every candidate flow by the
+# model's predicted accuracy and ask how good the recommended flow(s) are. This is
+# leave-tasks-out by construction (GroupKFold on task_id), so a task's flows are
+# always ranked by a model that never saw that task.
+#
+# The (task, flow) matrix is sparse -- a flow only has ground-truth accuracy on the
+# tasks where it was actually evaluated. So the candidate set for a held-out task is
+# "flows with a known target_value on that task", and regret is measured against the
+# best true accuracy *within that set*.
+#
+# Baselines: (1) random ordering, and (2) the "global-default" portfolio -- rank
+# flows by their mean training-task accuracy (the flow that is best on average).
+# Beating the global default is the real recommender claim.
+#
+# Warm-start "trials-to-best" curves are a planned second pass built on the same
+# per-task predictions collected here (see cross_val_flow_predictions).
+
+
+def cross_val_flow_predictions(
+    X,
+    y,
+    supervised_df: pd.DataFrame,
+    model,
+    model_name: str = "",
+    cv_folds: int = 5,
+    split_mode: str = "task_group_kfold",
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Collect out-of-fold accuracy predictions, one per (task, flow) row.
+
+    Returns ``supervised_df[["task_id", "flow_id", "target_value"]]`` with an added
+    ``y_pred`` column holding the held-out prediction for that row. Uses GroupKFold on
+    ``task_id`` for ``task_group_kfold`` so every row of a task is predicted by a model
+    trained without that task (the honest leave-tasks-out protocol). ``hist_gbrt`` is
+    densified per fold, mirroring :func:`evaluate_model_cv`.
+    """
+    groups = supervised_df["task_id"].values
+    splitter = _get_splitter(split_mode, n_splits=cv_folds, random_state=random_state)
+    if split_mode == "task_group_kfold":
+        split_iter = splitter.split(X, y, groups=groups)
+    else:
+        split_iter = splitter.split(X, y)
+
+    y_pred = np.full(len(y), np.nan, dtype=float)
+    for train_idx, test_idx in split_iter:
+        X_train = X[train_idx]
+        X_test = X[test_idx]
+        if model_name == "hist_gbrt":
+            X_train = _to_dense_if_sparse(X_train)
+            X_test = _to_dense_if_sparse(X_test)
+        model.fit(X_train, y[train_idx])
+        y_pred[test_idx] = model.predict(X_test)
+
+    pred_df = supervised_df[["task_id", "flow_id", "target_value"]].copy()
+    pred_df["y_pred"] = y_pred
+    return pred_df
+
+
+def _require_lightgbm():
+    try:
+        import lightgbm  # noqa: F401
+    except ImportError as e:
+        raise ImportError(
+            "Package 'lightgbm' is required for the LambdaMART ranker "
+            "(model_name='lambdamart'). Install it with: pip install lightgbm"
+        ) from e
+
+
+def lambdamart_flow_predictions(
+    X,
+    y,
+    supervised_df: pd.DataFrame,
+    cv_folds: int = 5,
+    split_mode: str = "task_group_kfold",
+    random_state: int = 42,
+    n_estimators: int = 300,
+    learning_rate: float = 0.05,
+    num_leaves: int = 31,
+    min_child_samples: int = 20,
+    max_relevance: int = 31,
+) -> pd.DataFrame:
+    """Out-of-fold LambdaMART (LightGBM ranker) scores, one per (task, flow) row.
+
+    A learning-to-rank alternative to :func:`cross_val_flow_predictions`: each task is a
+    query group and the model optimizes NDCG directly instead of regressing accuracy.
+    Per-task graded relevance is the accuracy min-max scaled to integers ``0..max_relevance``.
+    Returns the same shape as :func:`cross_val_flow_predictions` (a ``y_pred`` column of
+    ranking scores, higher = recommended first) so it scores identically under
+    :func:`ranking_metrics_per_task`.
+    """
+    _require_lightgbm()
+    from lightgbm import LGBMRanker
+
+    groups = supervised_df["task_id"].to_numpy()
+    splitter = _get_splitter(split_mode, n_splits=cv_folds, random_state=random_state)
+    split_iter = (
+        splitter.split(X, y, groups=groups)
+        if split_mode == "task_group_kfold"
+        else splitter.split(X, y)
+    )
+
+    y_pred = np.full(len(y), np.nan)
+    for train_idx, test_idx in split_iter:
+        g_tr = groups[train_idx]
+        order = np.argsort(g_tr, kind="stable")  # LGBMRanker needs contiguous query groups
+        X_s = X[train_idx][order]
+        y_s = y[train_idx][order]
+        _, sizes = np.unique(g_tr[order], return_counts=True)
+
+        rel = np.zeros(len(y_s), dtype=int)
+        i = 0
+        for sz in sizes:
+            block = y_s[i:i + sz]
+            rng = block.max() - block.min()
+            if rng > 0:
+                rel[i:i + sz] = np.round(max_relevance * (block - block.min()) / rng).astype(int)
+            i += sz
+
+        ranker = LGBMRanker(
+            objective="lambdarank", n_estimators=n_estimators, learning_rate=learning_rate,
+            num_leaves=num_leaves, min_child_samples=min_child_samples,
+            random_state=random_state, n_jobs=-1,
+            label_gain=[float(k) for k in range(max_relevance + 1)], verbose=-1,
+        )
+        ranker.fit(X_s, rel, group=list(sizes))
+        y_pred[test_idx] = ranker.predict(X[test_idx])
+
+    pred_df = supervised_df[["task_id", "flow_id", "target_value"]].copy()
+    pred_df["y_pred"] = y_pred
+    return pred_df
+
+
+def global_default_predictions(
+    y,
+    supervised_df: pd.DataFrame,
+    cv_folds: int = 5,
+    split_mode: str = "task_group_kfold",
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Portfolio baseline: score each flow by its mean accuracy on the training tasks.
+
+    Uses the same GroupKFold split as :func:`cross_val_flow_predictions`, so a flow's
+    "average accuracy" score for a held-out task excludes that task's fold (no leakage).
+    Flows unseen in a training fold fall back to the fold's global mean. Returns the same
+    shape as :func:`cross_val_flow_predictions` (a ``y_pred`` column) so it can be scored
+    by :func:`ranking_metrics_per_task` identically.
+    """
+    groups = supervised_df["task_id"].values
+    flow_ids = supervised_df["flow_id"].values
+    target = supervised_df["target_value"].values
+    splitter = _get_splitter(split_mode, n_splits=cv_folds, random_state=random_state)
+    if split_mode == "task_group_kfold":
+        split_iter = splitter.split(np.zeros(len(y)), y, groups=groups)
+    else:
+        split_iter = splitter.split(np.zeros(len(y)), y)
+
+    y_pred = np.full(len(y), np.nan, dtype=float)
+    for train_idx, test_idx in split_iter:
+        tr = pd.DataFrame({"flow_id": flow_ids[train_idx], "t": target[train_idx]})
+        flow_means = tr.groupby("flow_id")["t"].mean()
+        global_mean = float(target[train_idx].mean())
+        y_pred[test_idx] = [
+            float(flow_means.get(f, global_mean)) for f in flow_ids[test_idx]
+        ]
+
+    pred_df = supervised_df[["task_id", "flow_id", "target_value"]].copy()
+    pred_df["y_pred"] = y_pred
+    return pred_df
+
+
+def _dcg_at_k(gains: np.ndarray, k: int) -> float:
+    gains = np.asarray(gains, dtype=float)[:k]
+    if gains.size == 0:
+        return 0.0
+    discounts = 1.0 / np.log2(np.arange(2, gains.size + 2))
+    return float(np.sum(gains * discounts))
+
+
+def ranking_metrics_per_task(
+    pred_df: pd.DataFrame,
+    ks: tuple[int, ...] = (1, 3, 5, 10),
+    min_candidates: int = 2,
+) -> pd.DataFrame:
+    """Per-task ranking quality from a ``y_pred`` column produced by the functions above.
+
+    For each held-out task, flows are ordered by descending ``y_pred`` (ties broken by
+    ``flow_id`` for reproducibility) and compared to the true ``target_value`` ranking:
+
+    - ``regret@k``  -- best true accuracy minus the best accuracy among the top-k
+      predicted flows ("if I only run the k recommended flows, how far below optimal?").
+    - ``nregret@k`` -- ``regret@k`` normalized by the task's accuracy range, so tasks with
+      very different accuracy spreads are comparable in [0, 1].
+    - ``hit@k``     -- 1 if the truly-best flow is within the top-k predicted, else 0.
+    - ``ndcg@k``    -- NDCG using per-task min-max-normalized accuracy as graded relevance
+      (raw accuracies cluster near 1.0 and make plain NDCG uninformative).
+    - ``spearman``  -- rank correlation of predicted vs true accuracy over all candidates.
+
+    Tasks with fewer than ``min_candidates`` scored flows are skipped.
+    """
+    rows = []
+    for task_id, g in pred_df.groupby("task_id"):
+        g = g.dropna(subset=["y_pred", "target_value"])
+        n = len(g)
+        if n < min_candidates:
+            continue
+
+        order = g.sort_values(["y_pred", "flow_id"], ascending=[False, True])
+        true_in_pred_order = order["target_value"].to_numpy()
+        true = g["target_value"].to_numpy()
+        pred = g["y_pred"].to_numpy()
+
+        best = float(true.max())
+        worst = float(true.min())
+        acc_range = best - worst
+
+        if acc_range > 0:
+            rel_pred_order = (true_in_pred_order - worst) / acc_range
+            rel_ideal = np.sort(rel_pred_order)[::-1]
+        else:
+            rel_pred_order = np.zeros_like(true_in_pred_order)
+            rel_ideal = rel_pred_order
+
+        # spearmanr warns and returns NaN on a constant input. Note: with meta-only
+        # features every flow on a task shares the same feature vector, so the model
+        # predicts a constant and cannot rank within-task -- a real property, not a bug.
+        if n >= 3 and np.std(pred) > 0 and np.std(true) > 0:
+            rho = float(spearmanr(pred, true).correlation)
+        else:
+            rho = np.nan
+        best_flow = g.loc[g["target_value"].idxmax(), "flow_id"]
+        ordered_flows = order["flow_id"].to_numpy()
+
+        row = {
+            "task_id": task_id,
+            "n_candidates": n,
+            "best_true": best,
+            "acc_range": acc_range,
+            "spearman": rho,
+        }
+        for k in ks:
+            kk = min(k, n)
+            picked = float(true_in_pred_order[:kk].max())
+            row[f"regret@{k}"] = best - picked
+            row[f"nregret@{k}"] = (best - picked) / acc_range if acc_range > 0 else 0.0
+            row[f"hit@{k}"] = int(best_flow in set(ordered_flows[:kk]))
+            idcg = _dcg_at_k(rel_ideal, k)
+            row[f"ndcg@{k}"] = (
+                _dcg_at_k(rel_pred_order, k) / idcg if idcg > 0 else np.nan
+            )
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def random_baseline_metrics(
+    pred_df: pd.DataFrame,
+    ks: tuple[int, ...] = (1, 3, 5, 10),
+    n_shuffles: int = 20,
+    min_candidates: int = 2,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Expected ranking metrics under random flow ordering, averaged over ``n_shuffles``.
+
+    Reuses :func:`ranking_metrics_per_task` on random ``y_pred`` draws and averages the
+    numeric metrics per task, giving each task the same rows/columns as the model and
+    global-default methods.
+    """
+    rng = np.random.default_rng(random_state)
+    frames = []
+    for _ in range(n_shuffles):
+        shuffled = pred_df.copy()
+        shuffled["y_pred"] = rng.random(len(shuffled))
+        frames.append(
+            ranking_metrics_per_task(shuffled, ks=ks, min_candidates=min_candidates)
+        )
+    allm = pd.concat(frames, ignore_index=True)
+    num_cols = [c for c in allm.columns if c != "task_id"]
+    return allm.groupby("task_id", as_index=False)[num_cols].mean()
+
+
+def _max_trials_from_preds(pred_df: pd.DataFrame, min_candidates: int) -> int:
+    counts = pred_df.dropna(subset=["y_pred", "target_value"]).groupby("task_id").size()
+    counts = counts[counts >= min_candidates]
+    return int(counts.max()) if len(counts) else 0
+
+
+def warm_start_curve(
+    pred_df: pd.DataFrame,
+    max_trials: int | None = None,
+    min_candidates: int = 2,
+) -> pd.DataFrame:
+    """Regret-vs-#trials for greedy evaluation of flows in predicted-score order.
+
+    For each held-out task, evaluate candidate flows one at a time in descending
+    ``y_pred`` order and record the best true accuracy found after ``t`` trials. The
+    row ``regret = best_true - best_found_so_far`` is the search regret after ``t``
+    evaluations. Every task is extended to ``max_trials`` (its regret is 0 once all its
+    candidates have been tried), so the caller can average over ``trial`` directly.
+
+    Returns a long DataFrame with columns ``task_id``, ``trial``, ``regret``,
+    ``nregret`` (range-normalized), ``n_candidates``.
+    """
+    if max_trials is None:
+        max_trials = _max_trials_from_preds(pred_df, min_candidates)
+
+    rows = []
+    for task_id, g in pred_df.groupby("task_id"):
+        g = g.dropna(subset=["y_pred", "target_value"])
+        n = len(g)
+        if n < min_candidates:
+            continue
+
+        order = g.sort_values(["y_pred", "flow_id"], ascending=[False, True])
+        true_order = order["target_value"].to_numpy()
+        best = float(true_order.max())
+        acc_range = best - float(true_order.min())
+        best_so_far = np.maximum.accumulate(true_order)  # best true acc after each trial
+
+        for t in range(1, max_trials + 1):
+            idx = min(t, n) - 1  # beyond n, the best flow has already been tried
+            regret = best - float(best_so_far[idx])
+            rows.append(
+                {
+                    "task_id": task_id,
+                    "trial": t,
+                    "regret": regret,
+                    "nregret": regret / acc_range if acc_range > 0 else 0.0,
+                    "n_candidates": n,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def random_warm_start_curve(
+    pred_df: pd.DataFrame,
+    n_shuffles: int = 20,
+    max_trials: int | None = None,
+    min_candidates: int = 2,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Warm-start curve under random flow ordering, averaged over ``n_shuffles`` draws."""
+    if max_trials is None:
+        max_trials = _max_trials_from_preds(pred_df, min_candidates)
+
+    rng = np.random.default_rng(random_state)
+    frames = []
+    for _ in range(n_shuffles):
+        shuffled = pred_df.copy()
+        shuffled["y_pred"] = rng.random(len(shuffled))
+        frames.append(
+            warm_start_curve(shuffled, max_trials=max_trials, min_candidates=min_candidates)
+        )
+    allc = pd.concat(frames, ignore_index=True)
+    return allc.groupby(["task_id", "trial"], as_index=False).agg(
+        regret=("regret", "mean"),
+        nregret=("nregret", "mean"),
+        n_candidates=("n_candidates", "first"),
+    )
+
+
+def trials_to_target(curve_df: pd.DataFrame, eps_abs: float = 0.01) -> pd.DataFrame:
+    """Per-task number of trials to get within ``eps_abs`` accuracy of the best flow.
+
+    Regret is monotonically non-increasing in ``trial``, so this is the first trial at
+    which ``regret <= eps_abs``. If a task never reaches the tolerance within the curve's
+    trial budget, its value is the maximum trial (a right-censored upper bound).
+    """
+    rows = []
+    for task_id, g in curve_df.groupby("task_id"):
+        g = g.sort_values("trial")
+        hit = g[g["regret"] <= eps_abs]
+        t = int(hit["trial"].iloc[0]) if len(hit) else int(g["trial"].max())
+        rows.append(
+            {
+                "task_id": task_id,
+                "trials_to_target": t,
+                "n_candidates": int(g["n_candidates"].iloc[0]),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def paired_ranking_wilcoxon(
+    per_task_df: pd.DataFrame,
+    metric: str = "nregret@1",
+    baseline: str = "global_default",
+    methods: list[str] | None = None,
+    experiments: list[str] | None = None,
+    alternative: str = "two-sided",
+) -> pd.DataFrame:
+    """Paired Wilcoxon signed-rank test of each method vs a baseline, per experiment.
+
+    Tasks are paired by ``task_id`` within an experiment and ``method`` is compared to
+    ``baseline`` on ``metric`` (from :func:`ranking_metrics_per_task` output, as written to
+    ``ranking_metrics_per_task.csv``). Returns one row per (experiment, method) with the
+    signed-rank statistic, p-value, median paired difference (``method - baseline``), and
+    ``win_rate`` -- the fraction of tasks where the method beats the baseline, respecting
+    metric direction (lower is better for regret/nregret, higher for spearman/hit/ndcg).
+    """
+    lower_better = metric.startswith("regret") or metric.startswith("nregret")
+    rows = []
+    exps = experiments or sorted(per_task_df["experiment"].unique())
+    for exp in exps:
+        sub = per_task_df[per_task_df["experiment"] == exp]
+        base = (
+            sub[sub["method"] == baseline][["task_id", metric]]
+            .rename(columns={metric: "_base"})
+        )
+        cand = methods or [m for m in sub["method"].unique() if m != baseline]
+        for method in cand:
+            cur = (
+                sub[sub["method"] == method][["task_id", metric]]
+                .rename(columns={metric: "_cur"})
+            )
+            merged = cur.merge(base, on="task_id", how="inner").dropna()
+            if merged.empty:
+                continue
+            diff = merged["_cur"].to_numpy() - merged["_base"].to_numpy()  # method - baseline
+            n = len(diff)
+            wins = int((diff < 0).sum()) if lower_better else int((diff > 0).sum())
+            if np.any(diff != 0):
+                stat, p = wilcoxon(
+                    merged["_cur"].to_numpy(), merged["_base"].to_numpy(),
+                    zero_method="wilcox", alternative=alternative,
+                )
+                stat, p = float(stat), float(p)
+            else:
+                stat, p = np.nan, np.nan
+            rows.append(
+                {
+                    "experiment": exp,
+                    "method": method,
+                    "baseline": baseline,
+                    "metric": metric,
+                    "n_tasks": n,
+                    "median_diff": float(np.median(diff)),
+                    "win_rate": wins / n,
+                    "statistic": stat,
+                    "p_value": p,
+                }
+            )
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values(["experiment", "metric", "p_value"]).reset_index(drop=True)
+    return out
+
+
+def task_dependence_report(
+    supervised_df: pd.DataFrame,
+    min_shared: int = 3,
+    target_col: str = "target_value",
+) -> dict[str, Any]:
+    """Quantify how task-dependent the optimal flow is (the NFL / heterogeneity measure).
+
+    Low task-dependence means the same flows win everywhere, so a fixed portfolio is near
+    optimal and per-dataset adaptation (metafeatures) has little headroom; high means
+    different tasks need different flows, so data-dependence should pay. Returns:
+
+    - ``cross_task_spearman_mean``/``median``/``n_pairs`` -- agreement between tasks' *true*
+      flow rankings over their shared flows (high => flow quality is task-independent).
+    - ``n_distinct_best_flows``, ``top_best_flow_share``, ``best_flow_entropy`` --
+      concentration of the per-task best flow (concentrated => benign).
+    - ``per_task_best`` -- DataFrame(task_id, best_flow_id, best_value).
+
+    Designed to be run per benchmark so #3 can plot adaptation-value vs heterogeneity as the
+    benchmark union grows.
+    """
+    df = supervised_df[["task_id", "flow_id", target_col]].dropna()
+    idx = df.groupby("task_id")[target_col].idxmax()
+    per_task_best = (
+        df.loc[idx, ["task_id", "flow_id", target_col]]
+        .rename(columns={"flow_id": "best_flow_id", target_col: "best_value"})
+        .reset_index(drop=True)
+    )
+    best_counts = per_task_best["best_flow_id"].value_counts()
+    n_tasks = int(per_task_best["task_id"].nunique())
+    p = (best_counts / best_counts.sum()).to_numpy()
+    entropy = float(-(p * np.log2(p)).sum()) if len(p) else np.nan
+
+    task_vecs = {tid: g.set_index("flow_id")[target_col] for tid, g in df.groupby("task_id")}
+    tids = list(task_vecs)
+    rhos = []
+    for i in range(len(tids)):
+        a = task_vecs[tids[i]]
+        for j in range(i + 1, len(tids)):
+            b = task_vecs[tids[j]]
+            shared = a.index.intersection(b.index)
+            if len(shared) >= min_shared:
+                va, vb = a.loc[shared].to_numpy(), b.loc[shared].to_numpy()
+                if np.std(va) > 0 and np.std(vb) > 0:
+                    rhos.append(float(spearmanr(va, vb).correlation))
+    rhos = np.asarray(rhos, dtype=float)
+
+    return {
+        "n_tasks": n_tasks,
+        "cross_task_spearman_mean": float(np.nanmean(rhos)) if rhos.size else np.nan,
+        "cross_task_spearman_median": float(np.nanmedian(rhos)) if rhos.size else np.nan,
+        "n_pairs": int(rhos.size),
+        "n_distinct_best_flows": int(best_counts.size),
+        "top_best_flow_share": float(best_counts.iloc[0] / n_tasks) if n_tasks else np.nan,
+        "best_flow_entropy": entropy,
+        "per_task_best": per_task_best,
+    }
+
+
+def run_recommender_evaluation(
+    flows: dict,
+    tasks_df: pd.DataFrame,
+    evals_df: pd.DataFrame,
+    configs: list[dict[str, Any]],
+    agg_mode: str = "max",
+    model_name: str = "extra_trees",
+    model_names: list[str] | None = None,
+    cv_folds: int = 5,
+    split_mode: str = "task_group_kfold",
+    random_state: int = 42,
+    ks: tuple[int, ...] = (1, 3, 5, 10),
+    n_random_shuffles: int = 20,
+    min_candidates: int = 2,
+    include_knn: bool = False,
+    knn_k: int = 5,
+    metafeature_set: str = "basic",
+    qualities: pd.DataFrame | None = None,
+    min_coverage: float = 0.95,
+    toolkits: "list[str] | tuple[str, ...] | set[str] | None" = ("sklearn",),
+    compute_warm_start: bool = True,
+    warm_start_eps: float = 0.01,
+    warm_start_max_trials: int | None = None,
+    cache_dir: str | Path = DEFAULT_CACHE_DIR,
+    results_dir: str | Path = "results_recommender",
+) -> dict[str, Any]:
+    """Evaluate flow recommendation for each named config and write the ranking CSVs.
+
+    For every config (``{"name", "text_mode", "use_task_metafeatures"}``) this collects
+    leave-tasks-out predictions and scores each ranker plus two baselines --
+    ``global_default`` (portfolio baseline) and ``random``.
+
+    By default a single model (``model_name``) is used and its rows are labelled
+    ``method="model"``. Pass ``model_names`` (a list) to compare several regressors in one
+    run; then each model's rows are labelled with its name (e.g. ``method="random_forest"``)
+    while the two baselines are computed once per config. A ``role`` column marks each row
+    as ``"model"`` or ``"baseline"``.
+
+    Writes ``ranking_metrics_per_task.csv`` (one row per task/method/experiment) and
+    ``ranking_metrics.csv`` (means over tasks). When ``compute_warm_start`` is set it also
+    walks each ranking as a greedy search and writes ``warm_start_curve.csv`` (mean regret
+    vs #trials) and ``warm_start_trials_to_target.csv`` (trials to get within
+    ``warm_start_eps`` accuracy of the best flow).
+
+    ``agg_mode`` defaults to ``"max"``: ranking "which flow can win on this task" is the
+    natural recommendation target.
+    """
+    results_dir = ensure_dir(results_dir)
+    cache = DiskCache(cache_dir)
+
+    multi_model = model_names is not None
+    model_list = list(model_names) if multi_model else [model_name]
+
+    per_task_frames = []
+    summary_rows = []
+    ws_curve_frames = []
+    ws_tt_rows = []
+
+    for cfg in configs:
+        print(f"Recommender :: {cfg['name']} ({'+'.join(model_list)}, agg={agg_mode}) ...")
+        dataset = build_cc18_dataset(
+            flows=flows,
+            tasks_df=tasks_df,
+            evals_df=evals_df,
+            agg_mode=agg_mode,
+            text_mode=cfg["text_mode"],
+            use_task_metafeatures=cfg["use_task_metafeatures"],
+            metafeature_set=metafeature_set,
+            qualities=qualities,
+            min_coverage=min_coverage,
+            toolkits=toolkits,
+            cache=cache,
+        )
+        supervised_df = dataset["supervised_df"]
+        X = dataset["X"]
+        y = dataset["y"]
+
+        # One prediction frame per model (label = model name when comparing several,
+        # else the generic "model") plus the two model-independent baselines.
+        pred_frames: dict[str, tuple[pd.DataFrame, str, str]] = {}
+        for mname in model_list:
+            if mname == "lambdamart":
+                mpred = lambdamart_flow_predictions(
+                    X, y, supervised_df, cv_folds=cv_folds,
+                    split_mode=split_mode, random_state=random_state,
+                )
+            else:
+                model = get_models(random_state=random_state, selected_models=[mname])[mname]
+                mpred = cross_val_flow_predictions(
+                    X, y, supervised_df, model,
+                    model_name=mname, cv_folds=cv_folds,
+                    split_mode=split_mode, random_state=random_state,
+                )
+            label = mname if multi_model else "model"
+            pred_frames[label] = (mpred, "model", mname)
+
+        gd_pred = global_default_predictions(
+            y, supervised_df, cv_folds=cv_folds,
+            split_mode=split_mode, random_state=random_state,
+        )
+        first_pred = pred_frames[next(iter(pred_frames))][0]
+
+        method_metrics = {
+            label: (ranking_metrics_per_task(pred, ks=ks, min_candidates=min_candidates), role, mcol)
+            for label, (pred, role, mcol) in pred_frames.items()
+        }
+        method_metrics["global_default"] = (
+            ranking_metrics_per_task(gd_pred, ks=ks, min_candidates=min_candidates),
+            "baseline", "",
+        )
+        method_metrics["random"] = (
+            random_baseline_metrics(
+                first_pred, ks=ks, n_shuffles=n_random_shuffles,
+                min_candidates=min_candidates, random_state=random_state,
+            ),
+            "baseline", "",
+        )
+
+        knn_pred = None
+        if include_knn:
+            knn_pred = knn_task_predictions(
+                supervised_df, dataset["task_meta_cols"], k=knn_k,
+                cv_folds=cv_folds, split_mode=split_mode, random_state=random_state,
+            )
+            method_metrics["knn"] = (
+                ranking_metrics_per_task(knn_pred, ks=ks, min_candidates=min_candidates),
+                "baseline", "",
+            )
+
+        for method, (m, role, mcol) in method_metrics.items():
+            if m.empty:
+                continue
+            m = m.copy()
+            m.insert(0, "experiment", cfg["name"])
+            m.insert(1, "method", method)
+            m.insert(2, "role", role)
+            m.insert(3, "model", mcol)
+            per_task_frames.append(m)
+
+            srow = {
+                "experiment": cfg["name"],
+                "method": method,
+                "role": role,
+                "model": mcol,
+                "n_tasks": int(m["task_id"].nunique()),
+                "spearman_mean": float(m["spearman"].mean()),
+            }
+            for k in ks:
+                srow[f"regret@{k}_mean"] = float(m[f"regret@{k}"].mean())
+                srow[f"nregret@{k}_mean"] = float(m[f"nregret@{k}"].mean())
+                srow[f"hit@{k}_mean"] = float(m[f"hit@{k}"].mean())
+                srow[f"ndcg@{k}_mean"] = float(m[f"ndcg@{k}"].mean())
+            summary_rows.append(srow)
+
+        if compute_warm_start:
+            max_trials = warm_start_max_trials or _max_trials_from_preds(first_pred, min_candidates)
+            ws_curves = {
+                label: (warm_start_curve(pred, max_trials=max_trials, min_candidates=min_candidates), mcol)
+                for label, (pred, _role, mcol) in pred_frames.items()
+            }
+            ws_curves["global_default"] = (
+                warm_start_curve(gd_pred, max_trials=max_trials, min_candidates=min_candidates), "",
+            )
+            ws_curves["random"] = (
+                random_warm_start_curve(
+                    first_pred, n_shuffles=n_random_shuffles, max_trials=max_trials,
+                    min_candidates=min_candidates, random_state=random_state,
+                ), "",
+            )
+            if knn_pred is not None:
+                ws_curves["knn"] = (
+                    warm_start_curve(knn_pred, max_trials=max_trials, min_candidates=min_candidates), "",
+                )
+            for method, (curve, mcol) in ws_curves.items():
+                if curve.empty:
+                    continue
+                agg = curve.groupby("trial", as_index=False).agg(
+                    regret_mean=("regret", "mean"),
+                    nregret_mean=("nregret", "mean"),
+                    n_tasks=("task_id", "nunique"),
+                )
+                agg.insert(0, "experiment", cfg["name"])
+                agg.insert(1, "method", method)
+                agg.insert(2, "model", mcol)
+                ws_curve_frames.append(agg)
+
+                tt = trials_to_target(curve, eps_abs=warm_start_eps)
+                ws_tt_rows.append(
+                    {
+                        "experiment": cfg["name"],
+                        "method": method,
+                        "model": mcol,
+                        "eps_abs": warm_start_eps,
+                        "n_tasks": int(tt["task_id"].nunique()),
+                        "trials_to_target_mean": float(tt["trials_to_target"].mean()),
+                        "trials_to_target_median": float(tt["trials_to_target"].median()),
+                        "max_trials": int(max_trials),
+                    }
+                )
+
+    per_task_df = (
+        pd.concat(per_task_frames, ignore_index=True) if per_task_frames else pd.DataFrame()
+    )
+    summary_df = pd.DataFrame(summary_rows)
+    if not summary_df.empty:
+        summary_df = summary_df.sort_values(["experiment", "method"]).reset_index(drop=True)
+
+    per_task_df.to_csv(results_dir / "ranking_metrics_per_task.csv", index=False)
+    summary_df.to_csv(results_dir / "ranking_metrics.csv", index=False)
+
+    # Paired significance: each ranker vs each baseline, per experiment.
+    ranking_wilcoxon_df = pd.DataFrame()
+    if not per_task_df.empty:
+        model_methods = [
+            m for m in per_task_df["method"].unique()
+            if m not in ("global_default", "random")
+        ]
+        test_metrics = [
+            c for c in ("nregret@1", "nregret@3", "spearman") if c in per_task_df.columns
+        ]
+        wilcoxon_frames = [
+            paired_ranking_wilcoxon(
+                per_task_df, metric=metric, baseline=base, methods=model_methods
+            )
+            for metric in test_metrics
+            for base in ("global_default", "random")
+        ]
+        wilcoxon_frames = [f for f in wilcoxon_frames if not f.empty]
+        if wilcoxon_frames:
+            ranking_wilcoxon_df = pd.concat(wilcoxon_frames, ignore_index=True)
+            ranking_wilcoxon_df.to_csv(results_dir / "ranking_wilcoxon.csv", index=False)
+
+    warm_start_curve_df = (
+        pd.concat(ws_curve_frames, ignore_index=True) if ws_curve_frames else pd.DataFrame()
+    )
+    trials_to_target_df = pd.DataFrame(ws_tt_rows)
+    if compute_warm_start:
+        warm_start_curve_df.to_csv(results_dir / "warm_start_curve.csv", index=False)
+        if not trials_to_target_df.empty:
+            trials_to_target_df = trials_to_target_df.sort_values(
+                ["experiment", "method"]
+            ).reset_index(drop=True)
+        trials_to_target_df.to_csv(results_dir / "warm_start_trials_to_target.csv", index=False)
+
+    return {
+        "per_task": per_task_df,
+        "summary": summary_df,
+        "wilcoxon": ranking_wilcoxon_df,
+        "warm_start_curve": warm_start_curve_df,
+        "trials_to_target": trials_to_target_df,
+        "results_dir": results_dir,
+    }
+
+
+# ============================================================
+# Recommender explainability (SHAP on the ranker)
+# ============================================================
+#
+# Ranking orders flows by predicted accuracy, so TreeSHAP on the accuracy predictor IS
+# the explanation of the ranker. explain_ranker gives the *global* view (which flow-text
+# tokens and task metafeatures drive predictions) and explain_recommendations gives the
+# *local* view (why a specific top-ranked flow was recommended for a task).
+
+
+def _fit_full_ranker(X, y, model_name: str, random_state: int):
+    model = get_models(random_state=random_state, selected_models=[model_name])[model_name]
+    X_fit = _to_dense_if_sparse(X) if model_name == "hist_gbrt" else X
+    model.fit(X_fit, y)
+    return model
+
+
+def _namespace_of(feature: str) -> str:
+    if feature.startswith("meta::"):
+        return "meta"
+    if feature.startswith("text::emb_"):
+        return "embedding"
+    if feature.startswith("text::"):
+        return "text"
+    return "other"
+
+
+def explain_ranker(
+    flows: dict,
+    tasks_df: pd.DataFrame,
+    evals_df: pd.DataFrame,
+    text_mode: str = "tfidf",
+    use_task_metafeatures: bool = True,
+    agg_mode: str = "max",
+    model_name: str = "extra_trees",
+    shap_background_size: int = 200,
+    shap_eval_size: int = 400,
+    top_n: int = 30,
+    random_state: int = 42,
+    cache_dir: str | Path = DEFAULT_CACHE_DIR,
+    results_dir: str | Path = "results_recommender_shap",
+) -> dict[str, Any]:
+    """Global SHAP explanation of the flow ranker.
+
+    Fits ``model_name`` on the full supervised table and runs TreeSHAP over a sample of
+    rows, then ranks features by mean |SHAP| and splits them into ``text::`` /
+    ``embedding`` / ``meta::`` namespaces. Writes ``global_shap_ranker.csv`` (all features,
+    with signed mean SHAP so you can read direction) and ``namespace_shap_share.csv`` (how
+    much attribution mass each namespace carries) into ``results_dir``.
+
+    Returns a dict with ``global_shap`` (DataFrame), ``namespace_share`` (DataFrame),
+    ``top_text`` / ``top_meta`` (DataFrames), ``expected_value``, ``feature_names``.
+    """
+    results_dir = ensure_dir(results_dir)
+    cache = DiskCache(cache_dir)
+
+    dataset = build_cc18_dataset(
+        flows=flows, tasks_df=tasks_df, evals_df=evals_df, agg_mode=agg_mode,
+        text_mode=text_mode, use_task_metafeatures=use_task_metafeatures, cache=cache,
+    )
+    X, y, feature_names = dataset["X"], dataset["y"], dataset["feature_names"]
+
+    model = _fit_full_ranker(X, y, model_name, random_state)
+
+    rng = np.random.default_rng(random_state)
+    n = X.shape[0]
+    X_dense = np.asarray(_to_dense_if_sparse(X), dtype=np.float64)
+    bg_idx = rng.choice(n, size=min(shap_background_size, n), replace=False)
+    ev_idx = rng.choice(n, size=min(shap_eval_size, n), replace=False)
+
+    explainer = shap.TreeExplainer(
+        model, data=X_dense[bg_idx], feature_perturbation="interventional",
+        model_output="raw", feature_names=feature_names,
+    )
+    shap_values = explainer.shap_values(X_dense[ev_idx], check_additivity=False)
+
+    expected_value = explainer.expected_value
+    expected_value = float(np.ravel(expected_value)[0]) if isinstance(expected_value, np.ndarray) else float(expected_value)
+
+    global_shap = pd.DataFrame(
+        {
+            "feature": feature_names,
+            "namespace": [_namespace_of(f) for f in feature_names],
+            "mean_abs_shap": np.abs(shap_values).mean(axis=0),
+            "signed_mean_shap": shap_values.mean(axis=0),
+        }
+    ).sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
+
+    total = float(global_shap["mean_abs_shap"].sum())
+    namespace_share = (
+        global_shap.groupby("namespace", as_index=False)["mean_abs_shap"].sum()
+        .assign(share=lambda d: d["mean_abs_shap"] / total if total > 0 else np.nan)
+        .sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
+    )
+
+    top_text = global_shap[global_shap["namespace"].isin(["text", "embedding"])].head(top_n).reset_index(drop=True)
+    top_meta = global_shap[global_shap["namespace"] == "meta"].head(top_n).reset_index(drop=True)
+
+    global_shap.to_csv(results_dir / "global_shap_ranker.csv", index=False)
+    namespace_share.to_csv(results_dir / "namespace_shap_share.csv", index=False)
+
+    return {
+        "global_shap": global_shap,
+        "namespace_share": namespace_share,
+        "top_text": top_text,
+        "top_meta": top_meta,
+        "expected_value": expected_value,
+        "feature_names": feature_names,
+        "results_dir": results_dir,
+    }
+
+
+# ============================================================
+# Confidence-aware recommendation (conformal prediction)
+# ============================================================
+#
+# Point predictions become recommendations we act on, so they need calibrated intervals.
+# We use group split-conformal: inside each leave-tasks-out fold, hold out a disjoint set
+# of *training tasks* as a calibration set, take the (1 - alpha) quantile of absolute
+# calibration residuals as the half-width q, and emit [pred - q, pred + q]. Grouping the
+# calibration by task keeps coverage honest for the "new task" setting. The interval width
+# then drives *selective recommendation*: abstain on the least-confident tasks and check
+# whether regret drops on the ones we keep.
+
+
+def conformal_flow_predictions(
+    X,
+    y,
+    supervised_df: pd.DataFrame,
+    model,
+    model_name: str = "",
+    cv_folds: int = 5,
+    split_mode: str = "task_group_kfold",
+    alpha: float = 0.1,
+    calib_frac: float = 0.25,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Out-of-fold predictions with split-conformal intervals at level ``1 - alpha``.
+
+    For each leave-tasks-out fold, the training rows are split by task into a proper-train
+    set and a calibration set (``calib_frac`` of the training *tasks*). The model is fit on
+    proper-train; the conformal half-width ``q`` is the ``ceil((m+1)(1-alpha))/m`` quantile
+    of absolute calibration residuals. Returns ``supervised_df[["task_id","flow_id",
+    "target_value"]]`` plus ``y_pred``, ``lo``, ``hi``, ``width``.
+    """
+    groups = supervised_df["task_id"].to_numpy()
+    splitter = _get_splitter(split_mode, n_splits=cv_folds, random_state=random_state)
+    split_iter = (
+        splitter.split(X, y, groups=groups)
+        if split_mode == "task_group_kfold"
+        else splitter.split(X, y)
+    )
+    gss = GroupShuffleSplit(n_splits=1, test_size=calib_frac, random_state=random_state)
+
+    n = len(y)
+    y_pred = np.full(n, np.nan)
+    lo = np.full(n, np.nan)
+    hi = np.full(n, np.nan)
+
+    for train_idx, test_idx in split_iter:
+        g_tr = groups[train_idx]
+        pt_rel, cal_rel = next(gss.split(train_idx, groups=g_tr))
+        pt, cal = train_idx[pt_rel], train_idx[cal_rel]
+
+        X_pt, X_cal, X_te = X[pt], X[cal], X[test_idx]
+        if model_name == "hist_gbrt":
+            X_pt, X_cal, X_te = (_to_dense_if_sparse(a) for a in (X_pt, X_cal, X_te))
+
+        model.fit(X_pt, y[pt])
+        resid = np.abs(y[cal] - model.predict(X_cal))
+        m = len(resid)
+        level = min(1.0, np.ceil((m + 1) * (1 - alpha)) / m)
+        q = float(np.quantile(resid, level, method="higher"))
+
+        pred = model.predict(X_te)
+        y_pred[test_idx] = pred
+        lo[test_idx] = pred - q
+        hi[test_idx] = pred + q
+
+    out = supervised_df[["task_id", "flow_id", "target_value"]].copy()
+    out["y_pred"] = y_pred
+    out["lo"] = lo
+    out["hi"] = hi
+    out["width"] = hi - lo
+    return out
+
+
+def conformal_coverage(pred_df: pd.DataFrame) -> dict[str, float]:
+    """Empirical marginal coverage and mean interval width of conformal predictions."""
+    d = pred_df.dropna(subset=["y_pred", "target_value", "lo", "hi"])
+    covered = ((d["target_value"] >= d["lo"]) & (d["target_value"] <= d["hi"])).mean()
+    return {
+        "coverage": float(covered),
+        "mean_width": float(d["width"].mean()),
+        "n": int(len(d)),
+    }
+
+
+def selective_recommendation_curve(
+    pred_df: pd.DataFrame,
+    fractions: tuple[float, ...] = (0.2, 0.4, 0.6, 0.8, 1.0),
+    min_candidates: int = 2,
+) -> pd.DataFrame:
+    """Regret vs abstention: keep only the most-confident tasks and measure regret@1.
+
+    Task confidence is the mean conformal interval width over the task's candidate flows
+    (narrower = more confident). Tasks are sorted most-confident first; for each retained
+    fraction we report mean ``nregret@1`` on the kept tasks vs the overall mean. If
+    confidence is informative, the selective curve dips below the overall line at small
+    fractions.
+    """
+    rank = ranking_metrics_per_task(pred_df, ks=(1,), min_candidates=min_candidates)
+    conf = (
+        pred_df.dropna(subset=["width"]).groupby("task_id")["width"].mean().rename("mean_width")
+    )
+    m = rank.merge(conf, on="task_id", how="left").dropna(subset=["mean_width"])
+    m = m.sort_values("mean_width").reset_index(drop=True)
+    overall = float(m["nregret@1"].mean())
+
+    rows = []
+    n = len(m)
+    for f in fractions:
+        k = max(1, int(round(f * n)))
+        sel = m.head(k)
+        rows.append(
+            {
+                "retained_frac": f,
+                "n_tasks": k,
+                "nregret@1_selective": float(sel["nregret@1"].mean()),
+                "nregret@1_overall": overall,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def run_conformal_evaluation(
+    flows: dict,
+    tasks_df: pd.DataFrame,
+    evals_df: pd.DataFrame,
+    configs: list[dict[str, Any]],
+    agg_mode: str = "max",
+    model_name: str = "extra_trees",
+    cv_folds: int = 5,
+    alpha: float = 0.1,
+    calib_frac: float = 0.25,
+    random_state: int = 42,
+    cache_dir: str | Path = DEFAULT_CACHE_DIR,
+    results_dir: str | Path = "results_recommender_conformal",
+) -> dict[str, Any]:
+    """Conformal coverage + selective-recommendation curves per config.
+
+    Writes ``conformal_coverage.csv`` and ``selective_recommendation.csv`` into
+    ``results_dir`` and returns them along with the per-config conformal prediction frames.
+    """
+    results_dir = ensure_dir(results_dir)
+    cache = DiskCache(cache_dir)
+
+    cov_rows = []
+    sel_frames = []
+    pred_frames = {}
+
+    for cfg in configs:
+        print(f"Conformal :: {cfg['name']} ({model_name}, alpha={alpha}) ...")
+        dataset = build_cc18_dataset(
+            flows=flows, tasks_df=tasks_df, evals_df=evals_df, agg_mode=agg_mode,
+            text_mode=cfg["text_mode"], use_task_metafeatures=cfg["use_task_metafeatures"],
+            cache=cache,
+        )
+        model = get_models(random_state=random_state, selected_models=[model_name])[model_name]
+        pred = conformal_flow_predictions(
+            dataset["X"], dataset["y"], dataset["supervised_df"], model,
+            model_name=model_name, cv_folds=cv_folds, alpha=alpha,
+            calib_frac=calib_frac, random_state=random_state,
+        )
+        pred_frames[cfg["name"]] = pred
+
+        cov = conformal_coverage(pred)
+        cov_rows.append(
+            {
+                "experiment": cfg["name"], "model": model_name,
+                "alpha": alpha, "target_coverage": 1 - alpha, **cov,
+            }
+        )
+
+        sel = selective_recommendation_curve(pred)
+        sel.insert(0, "experiment", cfg["name"])
+        sel.insert(1, "model", model_name)
+        sel_frames.append(sel)
+
+    coverage_df = pd.DataFrame(cov_rows)
+    selective_df = pd.concat(sel_frames, ignore_index=True) if sel_frames else pd.DataFrame()
+    coverage_df.to_csv(results_dir / "conformal_coverage.csv", index=False)
+    selective_df.to_csv(results_dir / "selective_recommendation.csv", index=False)
+
+    return {
+        "coverage": coverage_df,
+        "selective": selective_df,
+        "predictions": pred_frames,
+        "results_dir": results_dir,
+    }
+
+
+# ============================================================
+# recommend() API + kNN meta-learning baseline
+# ============================================================
+#
+# FlowRecommender is the usable capability: fit once, then for a new task's metafeatures
+# rank candidate flows by predicted accuracy. knn_task_predictions is the classic
+# meta-learning baseline to beat -- score each flow by how it did on the k nearest training
+# tasks (by metafeature distance), the auto-sklearn-style "warm start from similar datasets".
+
+
+def _make_numeric_pipeline():
+    return Pipeline(
+        [
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler(with_mean=False)),
+        ]
+    )
+
+
+class FlowRecommender:
+    """Fit a flow ranker once, then recommend top-k flows for a new task.
+
+    ``fit`` builds the supervised dataset, fits the model on all rows, and stores the
+    fitted TF-IDF vectorizer + numeric metafeature pipeline so features for arbitrary new
+    (task, flow) pairs are built identically to training. ``recommend`` takes a new task's
+    metafeatures (a dict/Series keyed by the metafeature names) and returns the candidate
+    flows ranked by predicted accuracy. Supports ``text_mode`` ``"tfidf"`` / ``"none"``.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "extra_trees",
+        text_mode: str = "tfidf",
+        use_task_metafeatures: bool = True,
+        random_state: int = 42,
+    ) -> None:
+        if text_mode not in ("tfidf", "none"):
+            raise ValueError("FlowRecommender supports text_mode 'tfidf' or 'none'.")
+        self.model_name = model_name
+        self.text_mode = text_mode
+        self.use_task_metafeatures = use_task_metafeatures
+        self.random_state = random_state
+
+    def fit(self, flows, tasks_df, evals_df, agg_mode: str = "max", cache: DiskCache | None = None):
+        dataset = build_cc18_dataset(
+            flows=flows, tasks_df=tasks_df, evals_df=evals_df, agg_mode=agg_mode,
+            text_mode=self.text_mode, use_task_metafeatures=self.use_task_metafeatures,
+            cache=cache,
+        )
+        supervised_df = dataset["supervised_df"]
+        self.feature_names_ = dataset["feature_names"]
+        self.task_meta_cols_ = dataset["task_meta_cols"]
+        self.model_ = _fit_full_ranker(dataset["X"], dataset["y"], self.model_name, self.random_state)
+
+        self.text_vectorizer_ = (
+            dataset["feature_artifacts"].get("text_artifact") if self.text_mode == "tfidf" else None
+        )
+        if self.use_task_metafeatures:
+            self.numeric_pipe_ = _make_numeric_pipeline().fit(supervised_df[self.task_meta_cols_])
+        else:
+            self.numeric_pipe_ = None
+
+        self.flow_pool_ = (
+            supervised_df[["flow_id", "flow_name", "flow_text_clean"]]
+            .drop_duplicates("flow_id").reset_index(drop=True)
+        )
+        return self
+
+    def _features_for(self, flow_texts: pd.Series, task_metafeatures) -> sparse.csr_matrix:
+        parts = []
+        if self.text_mode == "tfidf":
+            parts.append(self.text_vectorizer_.transform(clean_text_series(flow_texts)))
+        if self.use_task_metafeatures:
+            row = {c: (task_metafeatures.get(c) if hasattr(task_metafeatures, "get") else None)
+                   for c in self.task_meta_cols_}
+            meta_df = pd.DataFrame([row] * len(flow_texts), columns=self.task_meta_cols_)
+            X_meta = self.numeric_pipe_.transform(meta_df)
+            if not sparse.issparse(X_meta):
+                X_meta = sparse.csr_matrix(X_meta)
+            parts.append(X_meta)
+        if not parts:
+            raise ValueError("No features configured.")
+        return sparse.hstack(parts).tocsr()
+
+    def recommend(self, task_metafeatures, candidate_flow_ids=None, top_k: int = 10) -> pd.DataFrame:
+        """Return candidate flows ranked by predicted accuracy for ``task_metafeatures``."""
+        pool = self.flow_pool_
+        if candidate_flow_ids is not None:
+            pool = pool[pool["flow_id"].isin(set(candidate_flow_ids))].reset_index(drop=True)
+        if pool.empty:
+            return pool.assign(predicted_accuracy=[])
+        X_new = self._features_for(pool["flow_text_clean"], task_metafeatures)
+        if self.model_name == "hist_gbrt":
+            X_new = _to_dense_if_sparse(X_new)
+        preds = self.model_.predict(X_new)
+        out = pool[["flow_id", "flow_name"]].copy()
+        out["predicted_accuracy"] = preds
+        return out.sort_values("predicted_accuracy", ascending=False).head(top_k).reset_index(drop=True)
+
+
+def knn_task_predictions(
+    supervised_df: pd.DataFrame,
+    task_meta_cols: list[str],
+    k: int = 5,
+    cv_folds: int = 5,
+    split_mode: str = "task_group_kfold",
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """kNN meta-learning baseline: score flows by their accuracy on the k nearest tasks.
+
+    Under the same leave-tasks-out split, each held-out task's candidate flows are scored by
+    the mean accuracy those flows achieved on the ``k`` nearest *training* tasks (Euclidean
+    distance in imputed+standardized metafeature space; scaler fit on training tasks only).
+    Flows unseen among the neighbours fall back to the neighbourhood mean. Returns the same
+    ``y_pred`` shape as :func:`cross_val_flow_predictions` for scoring by
+    :func:`ranking_metrics_per_task`.
+    """
+    tid = supervised_df["task_id"].to_numpy()
+    fid = supervised_df["flow_id"].to_numpy()
+    tgt = supervised_df["target_value"].to_numpy()
+    task_meta = supervised_df.groupby("task_id")[task_meta_cols].first()
+
+    splitter = _get_splitter(split_mode, n_splits=cv_folds, random_state=random_state)
+    split_iter = (
+        splitter.split(np.zeros(len(tid)), tgt, groups=tid)
+        if split_mode == "task_group_kfold"
+        else splitter.split(np.zeros(len(tid)), tgt)
+    )
+
+    y_pred = np.full(len(tid), np.nan)
+    for train_idx, test_idx in split_iter:
+        train_tasks = np.unique(tid[train_idx])
+        imp = SimpleImputer(strategy="median")
+        sc = StandardScaler()
+        M_tr = sc.fit_transform(imp.fit_transform(task_meta.loc[train_tasks]))
+        tr = pd.DataFrame({"flow_id": fid[train_idx], "t": tgt[train_idx], "task_id": tid[train_idx]})
+
+        for tt in np.unique(tid[test_idx]):
+            v = sc.transform(imp.transform(task_meta.loc[[tt]]))
+            dist = np.linalg.norm(M_tr - v, axis=1)
+            nn_tasks = train_tasks[np.argsort(dist)[:k]]
+            neigh = tr[tr["task_id"].isin(nn_tasks)]
+            flow_score = neigh.groupby("flow_id")["t"].mean()
+            gmean = float(neigh["t"].mean()) if len(neigh) else float(tgt[train_idx].mean())
+            rows = test_idx[tid[test_idx] == tt]
+            y_pred[rows] = [float(flow_score.get(f, gmean)) for f in fid[rows]]
+
+    out = supervised_df[["task_id", "flow_id", "target_value"]].copy()
+    out["y_pred"] = y_pred
+    return out
