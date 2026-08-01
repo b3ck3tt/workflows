@@ -16,18 +16,17 @@ pip install -r ../requirements.txt          # + lightgbm, optuna, shap, statsmod
   intermediates there and the data-build scripts below seed the OpenML caches.
 - OpenML access: `OPENML_API_KEY` env var (see `configure_openml` in `openml_flow.py`).
 
-**auto-sklearn 2.0 environment** (P3 §4.0b only — needs a legacy stack; on Apple Silicon use osx-64):
+**auto-sklearn 2.0 environment** (P3 §4.0b only — needs a legacy stack; on Apple Silicon uses osx-64):
 ```
-CONDA_SUBDIR=osx-64 conda create -n asklearn64 python=3.9 -y
-conda run -n asklearn64 conda config --env --set subdir osx-64
-CONDA_SUBDIR=osx-64 conda install -n asklearn64 -c conda-forge \
-    "scikit-learn=0.24.2" "numpy=1.21" "scipy=1.7" pyrfr swig cython -y
-conda run -n asklearn64 pip install "auto-sklearn==0.15.0" --no-build-isolation
-conda run -n asklearn64 pip install "pandas==1.5.3"          # 2.x removed DataFrame.iteritems (askl2 selector)
-# macOS: patch pynisher limit_function_call.py to wrap the RLIMIT_AS setrlimit in try/except (unsupported on Darwin)
+bash recommender_experiments/setup_asklearn_env.sh      # turnkey: creates env `asklearn64`, installs the
+                                                        # pinned stack, patches pynisher, verifies import
 ```
-auto-sklearn 2.0 = `autosklearn.experimental.askl2.AutoSklearn2Classifier` (a class inside the package,
-not a separate release). Use `memory_limit=<positive int>` (None trips an assert in 0.15).
+This is fully scriptable (osx-64 conda env, pinned scikit-learn 0.24.2 / numpy 1.21 / scipy 1.7 / pyrfr /
+swig, `auto-sklearn==0.15.0 --no-build-isolation`, `pandas==1.5.3`, and the macOS pynisher `RLIMIT_AS`
+no-op patch). Purge with `conda env remove -n asklearn64 && conda clean -a` and recreate anytime by
+re-running the script. auto-sklearn 2.0 = `autosklearn.experimental.askl2.AutoSklearn2Classifier`
+(a class inside the package, not a separate release). Use `memory_limit=<positive int>` (None trips an
+assert in 0.15).
 
 ## Data build (regenerates the caches from OpenML; slow, flaky endpoint — resumable)
 - `longtail_full_scan.py` — scan all OpenML classification tasks, keep dense (>=50 flows) → 1,236-task long tail.
