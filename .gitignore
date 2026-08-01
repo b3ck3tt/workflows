@@ -28,3 +28,9 @@ paper_recommender/
 
 # Local scratch dir/symlink for recommender_experiments intermediates
 scratch
+
+# Stray local data artifacts (regenerable; LLM pilot scores, loose result files)
+scratchpad_llm_*
+results_recommender_*.csv
+results_recommender_*.joblib
+_robust_full.py
