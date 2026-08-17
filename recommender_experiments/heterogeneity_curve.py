@@ -50,7 +50,7 @@ b = df.groupby("bin").agg(atyp=("atyp", "mean"), model_gain=("model_gain", "mean
                           knn_gain=("knn_gain", "mean"), default=("default", "mean"),
                           n=("atyp", "size")).reset_index()
 
-FIG = Path("paper_recommender/figures"); FIG.mkdir(parents=True, exist_ok=True)
+FIG = Path("papers/recommender/figures"); FIG.mkdir(parents=True, exist_ok=True)
 fig, ax = plt.subplots(figsize=(7.5, 5))
 ax.plot(b["atyp"], b["model_gain"], marker="o", color="#2c7fb8", label="text ranker (LambdaMART)")
 ax.plot(b["atyp"], b["knn_gain"], marker="s", color="#d95f02", label="kNN (similar tasks)")

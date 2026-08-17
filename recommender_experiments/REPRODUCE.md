@@ -81,6 +81,6 @@ Needs `ANTHROPIC_API_KEY` (env or `~/.anthropic_key`). Models: `claude-sonnet-5`
 
 ## Notes
 - Per-run outputs land in `results_recommender_*/` (gitignored, regenerable); paper drafts live in
-  `paper_recommender/` (local). Multi-hour runs: thread-pin (`OMP_NUM_THREADS=1` …) and shard across
+  `papers/recommender/` (local). Multi-hour runs: thread-pin (`OMP_NUM_THREADS=1` …) and shard across
   cores; each parallel writer needs its own `RESPATH` (no shared-file joblib race).
 - `random_state=42`, `cv_folds=5` are the standard defaults (see `../CLAUDE.md`).

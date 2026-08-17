@@ -1,0 +1,7 @@
+model_A,model_B,wilcoxon_stat,p_value,significant
+TFIDF_R1,TFIDF_R1_margin,4.0,4.397113554181895e-18,True
+TFIDF_R1,TFIDF_R1_bigrams,1782.0,0.010628687688281067,True
+TFIDF_R1,TFIDF_R1_margin_bigrams,3.0,4.266322730718234e-18,True
+TFIDF_R1_margin,TFIDF_R1_bigrams,9.0,5.112831740936499e-18,True
+TFIDF_R1_margin,TFIDF_R1_margin_bigrams,1538.0,0.0006897366388043001,True
+TFIDF_R1_bigrams,TFIDF_R1_margin_bigrams,10.0,5.269204481546394e-18,True

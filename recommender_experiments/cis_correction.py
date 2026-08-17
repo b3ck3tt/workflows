@@ -74,5 +74,5 @@ with contextlib.redirect_stdout(buf):
         print(f"  kNN {ms:>12} {m:>7.4f}  [{lo:.4f},{hi:.4f}]   vs port p={praw:.4f} -> BH {padj:.4f}")
 alltxt.append(buf.getvalue())
 print(buf.getvalue())
-open("paper_recommender/results_phase0/fix_K_cis_correction.txt","w").write("".join(alltxt))
+open("papers/recommender/results_phase0/fix_K_cis_correction.txt","w").write("".join(alltxt))
 print("DONE")

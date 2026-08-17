@@ -15,6 +15,9 @@ meta_only is skipped for stability (10 features -> top-10 == all -> Jaccard triv
 """
 import gc, time
 from itertools import combinations
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent   # lacci_experiments/ -> repo root
 
 import numpy as np
 import pandas as pd
@@ -68,7 +71,7 @@ for agg in ["max", "mean"]:
     rows_pred, rows_stab = [], []
     for cfg in CONFIGS:
         print(f"\n[{(time.time()-t0)/60:5.1f}m] {agg} :: {cfg}", flush=True)
-        a = joblib.load(f"results_cc18_{agg}/{cfg}/pipeline_artifacts.joblib")
+        a = joblib.load(REPO / f"results_cc18_{agg}" / cfg / "pipeline_artifacts.joblib")
         X, y, fnames = a["X"], a["y"], a["feature_names"]
         groups = a["supervised_df"]["task_id"].values
         uniq = np.unique(groups)
@@ -125,9 +128,9 @@ for agg in ["max", "mean"]:
                 })
         del a, X, y; gc.collect()
 
-    pd.DataFrame(rows_pred).to_csv(f"results_cc18_{agg}/robust_predictive_anchor_v2.csv", index=False)
+    pd.DataFrame(rows_pred).to_csv(REPO / f"results_cc18_{agg}" / "robust_predictive_anchor_v2.csv", index=False)
     if rows_stab:
-        pd.DataFrame(rows_stab).to_csv(f"results_cc18_{agg}/robust_stability.csv", index=False)
+        pd.DataFrame(rows_stab).to_csv(REPO / f"results_cc18_{agg}" / "robust_stability.csv", index=False)
     print(f"--- wrote {agg} CSVs ---", flush=True)
 
 print(f"\nROBUST FULL DONE in {(time.time()-t0)/60:.0f}m", flush=True)
