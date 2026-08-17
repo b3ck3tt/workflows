@@ -72,7 +72,7 @@ line=(f"SHAP-alignment vs empirical family performance:\n"
       f"  family-NAME-token SHAP (concentrated): Spearman={rho_n:+.3f} sign-agree={sg_n:.2f} (n={len(R)})\n"
       f"  TOTAL text-SHAP per family (distributed): Spearman={rho_d:+.3f} sign-agree={sg_d:.2f} (n={len(Rd)})")
 print("\n"+line)
-with open("paper_recommender/results_phase0/fix_I_shap_alignment.txt","w") as f:
+with open("papers/recommender/results_phase0/fix_I_shap_alignment.txt","w") as f:
     f.write("Fix I — quantitative SHAP-alignment metric (CC18, extra_trees, TreeSHAP; shallow 60x depth10 "
             "recompute for per-flow values — full model's namespace split 51/49 matches paper).\n"
             "name_shap = mean summed SHAP of the family's own name tokens; dist_shap = mean TOTAL text-SHAP\n"

@@ -11,8 +11,8 @@ __pycache__/
 .claude/
 CLAUDE.md
 
-# Paper artifacts (kept local)
-lacci2026/
+# Papers (kept local): sources consolidated under papers/
+papers/
 
 # DiskCache directories (rebuildable from OpenML)
 minimal_cache_cc18/
@@ -23,8 +23,6 @@ results_cc18_mean/
 results_cc18_*/
 results_recommender_*/
 
-# New recommender paper draft (kept local)
-paper_recommender/
 
 # Local scratch dir/symlink for recommender_experiments intermediates
 scratch
@@ -33,5 +31,10 @@ scratch
 scratchpad_llm_*
 results_recommender_*.csv
 results_recommender_*.joblib
-_robust_full.py
 longtail_census_sample.csv
+
+# SNCS notebook download caches (regenerated from OpenML by the collection cells;
+# flows3.txt alone is ~184 MB)
+sncs_experiments/*.txt
+sncs_experiments/*.joblib
+sncs_experiments/Output.csv
