@@ -1,0 +1,77 @@
+# G2 — larger pipeline space for the secondary experiment (PREREGISTRATION.md §7 / review §3.3, §5).
+# Extends G1 (grammar.yaml): every G1 genotype is a valid G2 genotype (G1 subset of G2). Same 3 stages
+# and genotype format {stage: {name, params}}; only the option sets grow. Structures: 5 x 9 x 13 = 585
+# (vs 63 in G1), so structural novelty no longer saturates after a few generations.
+# NB floats are written as plain decimals (PyYAML parses "1.0e-5" as a STRING, not a float).
+preprocessing:
+  none: {}
+  standardize: {}
+  minmax: {}
+  robust: {}
+  quantile:
+    output_distribution: {type: cat, choices: [uniform, normal]}
+feature_selection:
+  none: {}
+  selectk:
+    k: {type: int, low: 5, high: 50}
+  select_percentile:
+    percentile: {type: int, low: 10, high: 90}
+  mutual_info:
+    k: {type: int, low: 5, high: 50}
+  pca:
+    n: {type: int, low: 2, high: 50}
+  model_based:
+    C: {type: float, low: 0.01, high: 10.0, log: true}
+  polynomial:
+    degree: {type: int, low: 2, high: 3}
+    interaction_only: {type: cat, choices: [false, true]}
+  binning:
+    n_bins: {type: int, low: 3, high: 15}
+    strategy: {type: cat, choices: [uniform, quantile, kmeans]}
+  variance_threshold:
+    threshold: {type: float, low: 0.0, high: 0.1}
+estimator:
+  random_forest:
+    n_estimators: {type: int, low: 50, high: 500}
+    max_depth:    {type: int, low: 2, high: 20, optional: true}
+    min_samples_leaf: {type: int, low: 1, high: 20}
+    max_features: {type: cat, choices: [sqrt, log2, "0.5"]}
+  extra_trees:
+    n_estimators: {type: int, low: 50, high: 500}
+    max_depth:    {type: int, low: 2, high: 20, optional: true}
+    min_samples_leaf: {type: int, low: 1, high: 20}
+    max_features: {type: cat, choices: [sqrt, log2, "0.5"]}
+  hist_gbrt:
+    learning_rate:    {type: float, low: 0.01, high: 0.3, log: true}
+    max_leaf_nodes:   {type: int, low: 15, high: 255, log: true}
+    max_iter:         {type: int, low: 50, high: 300}
+    l2_regularization: {type: float, low: 0.000001, high: 1.0, log: true}
+  logistic:
+    C: {type: float, low: 0.001, high: 100.0, log: true}
+  svc:
+    C:     {type: float, low: 0.001, high: 100.0, log: true}
+    gamma: {type: cat, choices: [scale, auto]}
+  knn:
+    n_neighbors: {type: int, low: 1, high: 30}
+    weights:     {type: cat, choices: [uniform, distance]}
+  gaussian_nb: {}
+  mlp:
+    hidden:  {type: int, low: 20, high: 200}
+    alpha:   {type: float, low: 0.00001, high: 0.1, log: true}
+    lr_init: {type: float, low: 0.0001, high: 0.1, log: true}
+  gradient_boosting:
+    n_estimators:  {type: int, low: 50, high: 300}
+    learning_rate: {type: float, low: 0.01, high: 0.3, log: true}
+    max_depth:     {type: int, low: 2, high: 6}
+  adaboost:
+    n_estimators:  {type: int, low: 20, high: 200}
+    learning_rate: {type: float, low: 0.1, high: 2.0, log: true}
+  decision_tree:
+    max_depth:        {type: int, low: 2, high: 20, optional: true}
+    min_samples_leaf: {type: int, low: 1, high: 20}
+  ridge:
+    alpha: {type: float, low: 0.01, high: 10.0, log: true}
+  sgd:
+    loss:    {type: cat, choices: [hinge, log_loss, modified_huber]}
+    alpha:   {type: float, low: 0.00001, high: 0.01, log: true}
+    penalty: {type: cat, choices: [l2, l1, elasticnet]}

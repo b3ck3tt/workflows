@@ -1,0 +1,29 @@
+# Phase-3 END-TO-END smoke: exercises the whole run_phase3 lockstep driver (gen_contexts -> Batch API ->
+# apply -> next round -> result -> baselines -> summary) at tiny scale, to validate the pipeline live
+# for ~$1 BEFORE committing to the full base run. Not for the paper.
+run_id: phase3_smoke
+model: claude-haiku-4-5-20251001
+pricing: config/pricing.yaml
+
+budget_usd: 3.0
+preflight_confirm: true
+
+population: 8
+generations: 3
+max_generations: 90        # C1 safety ceiling; equal genuine-eval budget binds first
+tournament_k: 3
+elitism: 2
+seeds: [0]
+
+datasets: [23]                   # cmc only (small/fast: n=1473, f=10)
+
+cv_folds: 5
+eval_seed: 42
+row_cap: 5000
+
+operator: llm
+history_in_prompt: true
+fitness_in_prompt: true
+p_crossover: 0.5
+
+grammar: config/grammar.yaml

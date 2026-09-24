@@ -1,0 +1,35 @@
+# Phase-3 SECONDARY experiment: larger space G2 (PREREGISTRATION.md §7 / review §3.3, §5). Answers
+# "does the LLM-vs-random gap change with space size?" — turns the "bounded space" limitation into a
+# result (H7). Same everything as base EXCEPT the grammar (G2, 585 structures vs 63); G1 subset of G2.
+# GATED / OPT-IN: run AFTER the base G1 result, on the same Haiku model. ~$50-130 (batch).
+run_id: phase3_g2
+model: claude-haiku-4-5-20251001
+pricing: config/pricing.yaml
+
+budget_usd: 200.0
+preflight_confirm: true
+
+population: 50
+generations: 30
+max_generations: 90
+tournament_k: 3
+elitism: 2
+seeds: [0, 1, 2]
+
+# 5 structure-decisive tasks with headroom (so a larger space is usable); madelon/steel/gesture also
+# exercise the new feature-engineering options (polynomial, binning, model_based).
+datasets: [9976, 14969, 146817, 53, 2079]   # madelon, gesture, steel-plates, vehicle, eucalyptus
+
+cv_folds: 5
+eval_seed: 42
+row_cap: 5000
+eval_timeout: 120            # G2 safety: hard-kill an evaluation exceeding 120s (polynomial deg3 + svc etc.)
+
+operator: llm
+history_in_prompt: true
+fitness_in_prompt: true
+p_crossover: 0.5
+
+# The larger grammar. Its prefix is ~2.5k tokens (bigger than G1's ~1.9k) but still below Haiku's
+# 4096-token cache minimum, so caching stays OFF here too (same as G1 base) -> no cache confound.
+grammar: config/grammar_g2.yaml

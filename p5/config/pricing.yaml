@@ -1,0 +1,10 @@
+# Model pricing, $ per 1M tokens. VERIFY against the current price list before any spend.
+# Keys: inp = input, out = output, cw = cache write (1h ephemeral), cr = cache read.
+# Pricing lives here, never hard-coded (zadání 0.2).
+claude-haiku-4-5-20251001: {inp: 0.80, out: 4.0,  cw: 1.00,  cr: 0.08}
+claude-sonnet-5:           {inp: 3.0,  out: 15.0, cw: 3.75,  cr: 0.30}
+claude-opus-4-8:           {inp: 15.0, out: 75.0, cw: 18.75, cr: 1.50}
+# Open-weight via DeepInfra (OpenAI-compatible endpoint); no batch discount, no prompt cache (cw=cr=inp).
+# VERIFY rates against the current DeepInfra price list before any spend.
+Qwen/Qwen2.5-72B-Instruct:          {inp: 0.13, out: 0.40, cw: 0.13, cr: 0.13}
+meta-llama/Llama-3.3-70B-Instruct:  {inp: 0.23, out: 0.40, cw: 0.23, cr: 0.23}

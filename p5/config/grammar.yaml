@@ -1,0 +1,38 @@
+# Pipeline search space (zadani 1.2). Grammar in config, not in code.
+# Stages: preprocessing -> feature_selection -> estimator(+hyperparameters).
+# Param spec: {type: int|float|cat, low, high, log, choices, optional}.
+preprocessing:
+  none: {}
+  standardize: {}
+  minmax: {}
+feature_selection:
+  none: {}
+  selectk:
+    k: {type: int, low: 5, high: 50}
+  pca:
+    n: {type: int, low: 2, high: 50}
+estimator:
+  random_forest:
+    n_estimators: {type: int, low: 50, high: 500}
+    max_depth:    {type: int, low: 2, high: 20, optional: true}
+    min_samples_leaf: {type: int, low: 1, high: 20}
+    max_features: {type: cat, choices: [sqrt, log2, "0.5"]}
+  extra_trees:
+    n_estimators: {type: int, low: 50, high: 500}
+    max_depth:    {type: int, low: 2, high: 20, optional: true}
+    min_samples_leaf: {type: int, low: 1, high: 20}
+    max_features: {type: cat, choices: [sqrt, log2, "0.5"]}
+  hist_gbrt:
+    learning_rate:    {type: float, low: 0.01, high: 0.3, log: true}
+    max_leaf_nodes:   {type: int, low: 15, high: 255, log: true}
+    max_iter:         {type: int, low: 50, high: 300}
+    l2_regularization: {type: float, low: 0.000001, high: 1.0, log: true}
+  logistic:
+    C: {type: float, low: 0.001, high: 100.0, log: true}
+  svc:
+    C:     {type: float, low: 0.001, high: 100.0, log: true}
+    gamma: {type: cat, choices: [scale, auto]}
+  knn:
+    n_neighbors: {type: int, low: 1, high: 30}
+    weights:     {type: cat, choices: [uniform, distance]}
+  gaussian_nb: {}

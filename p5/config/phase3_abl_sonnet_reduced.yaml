@@ -1,0 +1,36 @@
+# Phase-3 ABLATION: model size = Sonnet, REDUCED scale (6 tasks x 3 seeds). Answers the reviewer's
+# "your negative result is just because Haiku is weak" -- does the no-advantage + structural-narrowness
+# pattern persist with a stronger model? Reduced scale is enough to show the trend.
+# HARD-GATED / OPT-IN: do NOT run until phase3_base is reviewed and you explicitly decide to spend on it.
+# ~$252 non-batch (~$126 batch). Sonnet is ~3.75x haiku per token. No caching (prefix < 1024? no -- sonnet
+# min is 1024 and prefix is 1889, so caching WOULD activate here; estimate_run_cost accounts for it).
+run_id: phase3_abl_sonnet_reduced
+model: claude-sonnet-5
+pricing: config/pricing.yaml
+
+budget_usd: 350.0
+preflight_confirm: true
+
+population: 50
+generations: 30
+max_generations: 90        # C1 safety ceiling; equal genuine-eval budget binds first
+tournament_k: 3
+elitism: 2
+seeds: [0, 1]                     # C2 (accepted): model ablation = ALL 15 tasks x FEWER seeds, not fewer tasks
+
+# Full Phase-3 15 (cc18_phase3), so the model-strength result is not confounded by a different task set.
+datasets: [9985, 14969, 2079, 18, 146817, 9910, 53, 9976, 43, 23, 14954, 14, 29, 9952, 146822]
+# TODO (C2, accepted): also run an OPEN-WEIGHT model (Qwen/Llama via the P4 cross-vendor OpenAI-compatible
+# endpoint) for reproducibility. Needs a separate OpenAI-compatible batch client (the Anthropic Batches API
+# used by run_phase3 does not cover DeepInfra); config phase3_abl_openweight.yaml to be added then.
+
+cv_folds: 5
+eval_seed: 42
+row_cap: 5000
+
+operator: llm
+history_in_prompt: true
+fitness_in_prompt: true
+p_crossover: 0.5
+
+grammar: config/grammar.yaml

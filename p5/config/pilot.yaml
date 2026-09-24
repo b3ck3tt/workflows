@@ -1,0 +1,31 @@
+# One file = one experiment (zadání 0.1). This is the Phase-2 pilot config.
+run_id: pilot
+model: claude-haiku-4-5-20251001
+pricing: config/pricing.yaml
+
+# Budget guard (zadání 0.4). Hard cumulative cap in USD; run aborts when exceeded.
+budget_usd: 15.0
+preflight_confirm: true          # estimate cost from count_tokens and require confirmation before start
+
+# GA (zadání 1.3) — pilot-reduced (zadání 2.4)
+population: 12
+generations: 6
+tournament_k: 3
+elitism: 2
+seeds: [0, 1, 2]
+
+# Datasets (zadani 1.4 / 2.4): pilot uses 3 CC-18 tasks (see config/datasets.yaml : pilot_3).
+datasets: [15, 11, 53]           # breast-w (bin), balance-scale (3-cls), vehicle (4-cls)
+
+# Evaluation (zadání 1.1)
+cv_folds: 5
+eval_seed: 42
+row_cap: 5000                    # cap large datasets for a defensible per-eval budget
+
+# Operator (zadání 2.1): the LLM operator; swap to random_operator for the baseline.
+operator: llm                    # llm | random
+history_in_prompt: true          # include short population history (ablation axis, zadání 3)
+fitness_in_prompt: true          # include parent fitness (ablation axis, zadání 3)
+
+# Grammar of the pipeline space (zadání 1.2) — external, not in code.
+grammar: config/grammar.yaml

@@ -1,0 +1,36 @@
+# Phase-3 BASE run (zadani v2 sec. 3). One file = one experiment. RUN ONLY AFTER the decision-gate
+# consultation. Full protocol: 15 datasets x 5 seeds, population 50, 30 generations.
+# Baselines (random-GA, random-search) run alongside for free (no API).
+# NOTE: the runner is synchronous -> costs are NON-BATCH. Batch API (zadani: "na vse co nemusi byt
+# synchronni") is a separate implementation task that would ~halve the LLM spend.
+# Estimated LLM cost ~ $280 non-batch (grounded in pilot_hard_v2 actuals). No caching (prefix < 4096).
+run_id: phase3_base
+model: claude-haiku-4-5-20251001
+pricing: config/pricing.yaml
+
+budget_usd: 400.0                 # hard cap, ~40% over the ~$280 estimate; preflight aborts if over
+preflight_confirm: true
+
+# GA (zadani 1.3 / 3): full scale
+population: 50
+generations: 30
+max_generations: 90        # C1 safety ceiling; equal genuine-eval budget binds first
+tournament_k: 3
+elitism: 2
+seeds: [0, 1, 2, 3, 4]
+
+# Datasets: the Phase-3 15 (datasets.yaml : cc18_phase3) -- "set B + safeguard": headroom spread, 9
+# structure-decisive + 6 hp-decisive (the control subset), NOT the smallest-15. See PREREGISTRATION.md.
+datasets: [9985, 14969, 2079, 18, 146817, 9910, 53, 9976, 43, 23, 14954, 14, 29, 9952, 146822]
+
+cv_folds: 5
+eval_seed: 42
+row_cap: 5000
+
+# Operator (base = full LLM operator): mutation + crossover, fitness + history in prompt.
+operator: llm
+history_in_prompt: true
+fitness_in_prompt: true
+p_crossover: 0.5
+
+grammar: config/grammar.yaml

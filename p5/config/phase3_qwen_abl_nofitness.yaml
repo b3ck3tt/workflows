@@ -1,0 +1,31 @@
+# Phase-3 ABLATION (on the Qwen co-primary): fitness feedback in prompt OFF.
+run_id: phase3_qwen_abl_nofitness
+model: Qwen/Qwen2.5-72B-Instruct
+base_url: https://api.deepinfra.com/v1/openai
+pricing: config/pricing.yaml
+
+budget_usd: 80.0
+preflight_confirm: true
+concurrency: 12            # higher than the pilot's 8 to cut the ~4% network-straggler fallback rate
+temperature: 0.7
+round_deadline: 300        # per-round hard cap; stragglers -> random fallback (never stalls)
+
+population: 50
+generations: 30
+max_generations: 90
+tournament_k: 3
+elitism: 2
+seeds: [0, 1, 2]        # ablation: 3 seeds
+
+datasets: [9985, 14969, 2079, 18, 146817, 9910, 53, 9976, 43, 23, 14954, 14, 29, 9952, 146822]  # cc18_phase3
+
+cv_folds: 5
+eval_seed: 42
+row_cap: 5000
+
+operator: llm
+history_in_prompt: true
+fitness_in_prompt: false   # <-- ablated
+p_crossover: 0.5
+
+grammar: config/grammar.yaml

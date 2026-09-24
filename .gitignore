@@ -38,3 +38,6 @@ longtail_census_sample.csv
 sncs_experiments/*.txt
 sncs_experiments/*.joblib
 sncs_experiments/Output.csv
+
+# Standalone paper release repo (github.com/b3ck3tt/paper-tae), kept separate
+paper-tae/

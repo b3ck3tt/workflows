@@ -1,0 +1,33 @@
+# One file = one experiment (zadání 0.1). Hard-task pilot re-check (decision-gate fix #2):
+# same protocol as config/pilot.yaml but on lower-ceiling tasks with real headroom, to confirm the
+# metrics separate methods when the ceiling no longer masks differences. See datasets.yaml : pilot_hard_3.
+run_id: pilot_hard
+model: claude-haiku-4-5-20251001
+pricing: config/pricing.yaml
+
+# Budget guard (zadání 0.4). Hard cumulative cap in USD; run aborts when exceeded.
+budget_usd: 15.0
+preflight_confirm: true          # estimate cost from count_tokens and require confirmation before start
+
+# GA (zadání 1.3) — pilot-reduced (zadání 2.4)
+population: 12
+generations: 6
+tournament_k: 3
+elitism: 2
+seeds: [0, 1, 2]
+
+# Datasets: hard pilot subset (datasets.yaml : pilot_hard_3).
+datasets: [9976, 14969, 23]      # madelon (bin, FS-decisive), GesturePhase (5-cls), cmc (3-cls, low ceiling)
+
+# Evaluation (zadání 1.1)
+cv_folds: 5
+eval_seed: 42
+row_cap: 5000                    # cap large datasets for a defensible per-eval budget
+
+# Operator (zadání 2.1): the LLM operator; swap to random_operator for the baseline.
+operator: llm                    # llm | random
+history_in_prompt: true          # include short population history (ablation axis, zadání 3)
+fitness_in_prompt: true          # include parent fitness (ablation axis, zadání 3)
+
+# Grammar of the pipeline space (zadání 1.2) — external, not in code.
+grammar: config/grammar.yaml

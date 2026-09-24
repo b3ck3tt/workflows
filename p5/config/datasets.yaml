@@ -1,0 +1,83 @@
+# Fixed dataset selection (zadani 1.4): 15 OpenML CC-18 tasks, the smallest by instance count
+# (budget-friendly, spans binary and multiclass). Selection is fixed and recorded here; do not change
+# without re-running everything.
+cc18_15:
+  - {tid: 125920, name: dresses-sales,            n: 500, f: 13, c: 2}
+  - {tid: 3913,   name: kc2,                       n: 522, f: 22, c: 2}
+  - {tid: 14954,  name: cylinder-bands,            n: 540, f: 40, c: 2}
+  - {tid: 146819, name: climate-model-simulation,  n: 540, f: 21, c: 2}
+  - {tid: 9946,   name: wdbc,                      n: 569, f: 31, c: 2}
+  - {tid: 9971,   name: ilpd,                      n: 583, f: 11, c: 2}
+  - {tid: 11,     name: balance-scale,             n: 625, f: 5,  c: 3}
+  - {tid: 29,     name: credit-approval,           n: 690, f: 16, c: 2}
+  - {tid: 15,     name: breast-w,                  n: 699, f: 10, c: 2}
+  - {tid: 2079,   name: eucalyptus,                n: 736, f: 20, c: 5}
+  - {tid: 10101,  name: blood-transfusion,         n: 748, f: 5,  c: 2}
+  - {tid: 37,     name: diabetes,                  n: 768, f: 9,  c: 2}
+  - {tid: 3560,   name: analcatdata_dmft,          n: 797, f: 5,  c: 6}
+  - {tid: 3549,   name: analcatdata_authorship,    n: 841, f: 71, c: 4}
+  - {tid: 53,     name: vehicle,                   n: 846, f: 19, c: 4}
+
+# Pilot subset (zadani 2.4): 3 tasks spanning binary / 3-class / 4-class.
+pilot_3: [15, 11, 53]
+
+# --- Phase-3 HARD set (decision-gate fix #2) --------------------------------------------------------
+# The pilot's tasks sit near ceiling (0.96-0.97), so no method could separate from another. This set is
+# chosen empirically from real OpenML sklearn-flow evaluations (minimal_cache_cc18 bundle, 3.78M runs):
+#   ceiling  = 95th pct of predictive_accuracy over sklearn flows (robust "best achievable")
+#   majority = trivial majority-class baseline (learnable signal exists iff ceiling >> majority)
+#   matters  = ceiling - median: how much the CHOICE of pipeline moves accuracy (operator sensitivity)
+# Kept: low ceiling (<=0.85, real headroom to differ) AND learnable (ceiling-majority large) AND high
+# `matters` (search can actually help). Spans 2/3/4/5/6/7 classes and 10..1777 features.
+# Excluded on purpose: near-random tasks where even the best barely beats majority, so nothing to
+# optimize -- analcatdata_dmft(3560, ceil .225/maj .194), numerai28.6(.522/.505), ilpd(9971, .719/.714).
+# Note: dataset size affects only local CV wall-clock, NOT LLM $ (the prompt never sees the data).
+cc18_hard:
+  - {tid: 23,     name: cmc,                        n: 1473, f: 10,   c: 3, majority: 0.427, ceiling: 0.560, matters: 0.056}
+  - {tid: 9985,   name: first-order-theorem,        n: 6118, f: 52,   c: 6, majority: 0.417, ceiling: 0.622, matters: 0.097}
+  - {tid: 14969,  name: GesturePhaseSegmentation,   n: 9873, f: 33,   c: 5, majority: 0.299, ceiling: 0.658, matters: 0.178}
+  - {tid: 2079,   name: eucalyptus,                 n: 736,  f: 20,   c: 5, majority: 0.291, ceiling: 0.671, matters: 0.062}
+  - {tid: 146817, name: steel-plates-fault,         n: 1941, f: 28,   c: 7, majority: 0.347, ceiling: 0.798, matters: 0.060}
+  - {tid: 9910,   name: Bioresponse,                n: 3751, f: 1777, c: 2, majority: 0.542, ceiling: 0.808, matters: 0.058}
+  - {tid: 53,     name: vehicle,                     n: 846,  f: 19,   c: 4, majority: 0.258, ceiling: 0.832, matters: 0.115}
+  - {tid: 9976,   name: madelon,                     n: 2600, f: 501,  c: 2, majority: 0.500, ceiling: 0.850, matters: 0.273}
+
+# Hard pilot subset for a cheap re-check that the metrics discriminate WITH headroom, before full Phase 3:
+# madelon (FS-decisive, matters .273), gesture (5-class, matters .178), cmc (lowest learnable ceiling .560).
+pilot_hard_3: [9976, 14969, 23]
+
+# --- Phase-3 dataset set (15 tasks) : "set B + safeguard" -----------------------------------------
+# REPLACES the zadani-1.4 "smallest 15" (cc18_15) for the full runs. The pilot showed the smallest tasks
+# sit near ceiling (0.96-0.97) and cannot separate methods; this set is chosen for a representative
+# ceiling spread WITH headroom (0.56-0.95), classes 2-10, tractable sizes (max n 9873, max f 1777).
+#
+# SELECTION CRITERION (pre-registered, see PREREGISTRATION.md): tasks are chosen ONLY by task-intrinsic
+# learnability (ceiling from historical OpenML sklearn-flow evals, and headroom = ceiling - majority).
+# This criterion is INDEPENDENT of any LLM-vs-random outcome -> not outcome cherry-picking.
+#
+# SAFEGUARD tag `decisive` (empirical, from variance decomposition of the same historical evals):
+#   structure = picking the right estimator/structure gains more accuracy than HP tuning within a structure
+#   hp        = HP tuning within a fixed structure gains as much or more than switching structure
+# The LLM operator's known weakness is structural narrowness, so it is *handicapped by construction* on
+# structure-decisive tasks. The 6 hp-decisive tasks are the CONTROL subset: if the LLM shows no advantage
+# even there (where narrowness is not a handicap), the negative result is not a task-selection artifact.
+# NB: hp-decisive tasks with headroom are genuinely rare in CC-18 (structure usually dominates) -- this
+# 9:6 split is the most balanced achievable, and that scarcity is itself a reportable finding.
+cc18_phase3:
+  # --- structure-decisive (9): LLM narrowness is a handicap here ---
+  - {tid: 9985,   name: first-order-theorem,  n: 6118, f: 52,   c: 6,  ceiling: 0.622, decisive: structure}
+  - {tid: 14969,  name: GesturePhaseSegment,  n: 9873, f: 33,   c: 5,  ceiling: 0.658, decisive: structure}
+  - {tid: 2079,   name: eucalyptus,           n: 736,  f: 20,   c: 5,  ceiling: 0.671, decisive: structure}
+  - {tid: 18,     name: mfeat-morphological,  n: 2000, f: 7,    c: 10, ceiling: 0.746, decisive: structure}
+  - {tid: 146817, name: steel-plates-fault,   n: 1941, f: 28,   c: 7,  ceiling: 0.798, decisive: structure}
+  - {tid: 9910,   name: Bioresponse,          n: 3751, f: 1777, c: 2,  ceiling: 0.808, decisive: structure}
+  - {tid: 53,     name: vehicle,              n: 846,  f: 19,   c: 4,  ceiling: 0.832, decisive: structure}
+  - {tid: 9976,   name: madelon,              n: 2600, f: 501,  c: 2,  ceiling: 0.850, decisive: structure}
+  - {tid: 43,     name: spambase,             n: 4601, f: 58,   c: 2,  ceiling: 0.951, decisive: structure}
+  # --- hp-decisive CONTROL (6): LLM narrowness is NOT a handicap here ---
+  - {tid: 23,     name: cmc,                  n: 1473, f: 10,   c: 3,  ceiling: 0.560, decisive: hp}
+  - {tid: 14954,  name: cylinder-bands,       n: 540,  f: 40,   c: 2,  ceiling: 0.833, decisive: hp}
+  - {tid: 14,     name: mfeat-fourier,        n: 2000, f: 77,   c: 10, ceiling: 0.845, decisive: hp}
+  - {tid: 29,     name: credit-approval,      n: 690,  f: 16,   c: 2,  ceiling: 0.870, decisive: hp}
+  - {tid: 9952,   name: phoneme,              n: 5404, f: 6,    c: 2,  ceiling: 0.902, decisive: hp}
+  - {tid: 146822, name: segment,              n: 2310, f: 20,   c: 7,  ceiling: 0.937, decisive: hp}

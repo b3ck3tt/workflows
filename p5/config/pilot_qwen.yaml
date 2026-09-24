@@ -1,0 +1,32 @@
+# Qwen pilot (mirror of the Haiku pilot_hard_v2): does the mechanism replicate on an open-weight model,
+# and does the concurrent OpenAI-compatible client scale? Run via run_phase3.py so it exercises the REAL
+# Phase-3 path (ConcurrentBatchClient + C1 eval-budget stopping + BatchGA). ~$0.3 from DeepInfra credit.
+run_id: pilot_qwen
+model: Qwen/Qwen2.5-72B-Instruct
+base_url: https://api.deepinfra.com/v1/openai
+pricing: config/pricing.yaml
+
+budget_usd: 5.0
+preflight_confirm: true
+concurrency: 8
+temperature: 0.7
+
+population: 12
+generations: 6
+max_generations: 18
+tournament_k: 3
+elitism: 2
+seeds: [0, 1, 2]
+
+datasets: [9976, 14969, 23]   # pilot_hard_3: madelon, gesture, cmc (same as the Haiku hard pilot)
+
+cv_folds: 5
+eval_seed: 42
+row_cap: 5000
+
+operator: llm
+history_in_prompt: true
+fitness_in_prompt: true
+p_crossover: 0.5
+
+grammar: config/grammar.yaml    # G1, to compare directly with the Haiku pilot
