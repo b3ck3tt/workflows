@@ -3,6 +3,7 @@ message: "If you use this software, please cite it as below."
 type: software
 title: "workflows: meta-learning models of machine learning workflow performance"
 license: MIT
+doi: "10.5281/zenodo.22936995"
 repository-code: "https://github.com/b3ck3tt/workflows"
 authors:
   - family-names: Neruda

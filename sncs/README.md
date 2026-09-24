@@ -11,6 +11,8 @@ different line of work on the same data — a task-grouped, explanation-oriented
 protocol — and does **not** reproduce the numbers in the SNCS article. The two
 differ deliberately: see "Relation to the rest of the repo" below.
 
+Software archive (whole repository, including this directory): [doi:10.5281/zenodo.22936995](https://doi.org/10.5281/zenodo.22936995).
+
 ## Contents
 
 | File | What it is |

@@ -1,5 +1,7 @@
 # OpenML Flow Performance Prediction
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22936995.svg)](https://doi.org/10.5281/zenodo.22936995)
+
 This repository contains a **research pipeline for predicting the benchmark performance of machine learning flows on OpenML tasks**, with a strong emphasis on cross-validation, statistical testing, and SHAP-based interpretability.
 
 The code targets the **OpenML-CC18 benchmark suite** and explores whether the performance of ML pipelines can be predicted — and *explained* — from:
@@ -226,6 +228,15 @@ predictive_anchor.csv
 shap_summary_metrics_all.csv
 local_shap_metrics_summary.csv
 ```
+
+---
+
+# Citation
+
+The software is archived on Zenodo: [doi:10.5281/zenodo.22936995](https://doi.org/10.5281/zenodo.22936995)
+(this DOI always resolves to the latest version; v1.0 is
+[doi:10.5281/zenodo.22936996](https://doi.org/10.5281/zenodo.22936996)).
+Please also cite the paper whose code you use — see [Papers in this repository](#papers-in-this-repository).
 
 ---
 
