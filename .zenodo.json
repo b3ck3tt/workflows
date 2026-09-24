@@ -1,0 +1,22 @@
+{
+  "upload_type": "software",
+  "title": "workflows: meta-learning models of machine learning workflow performance",
+  "creators": [
+    {
+      "name": "Neruda, Roman",
+      "affiliation": "Institute of Computer Science, Czech Academy of Sciences"
+    }
+  ],
+  "description": "<p>Research code for predicting, recommending and explaining the performance of machine learning workflows (scikit-learn flows) on OpenML tasks, using meta-learning over historical OpenML evaluations. Workflows are represented by their textual descriptions (TF-IDF, count, hashing, MiniLM embeddings) combined with dataset meta-features.</p><p>Contents: the core pipeline (<code>openml_flow.py</code>) with task-grouped cross-validation, statistical testing and SHAP-based explanation-quality metrics; <code>sncs/</code>, the study for the SN Computer Science article <em>Learning from Prior Experiments: Meta-Learning Models of Workflow Performance</em>; <code>lacci/</code>, experiments for the LACCI 2026 paper on lexical vs dense workflow representations; and <code>recommender/</code>, scripts for the warm-start AutoML recommender line of work.</p><p>This work has been funded by a grant from the Programme Johannes Amos Comenius under the Ministry of Education, Youth and Sports of the Czech Republic, CZ.02.01.01/00/23_025/0008711.</p>",
+  "license": "MIT",
+  "keywords": ["machine learning", "meta-learning", "performance prediction", "AutoML", "OpenML", "workflow recommendation", "SHAP"],
+  "related_identifiers": [
+    {
+      "identifier": "10.1007/s42979-026-05295-9",
+      "relation": "isSupplementTo",
+      "resource_type": "publication-article",
+      "scheme": "doi"
+    }
+  ],
+  "notes": "Funding: Programme Johannes Amos Comenius, Ministry of Education, Youth and Sports of the Czech Republic, CZ.02.01.01/00/23_025/0008711."
+}

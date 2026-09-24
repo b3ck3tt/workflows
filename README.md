@@ -229,6 +229,14 @@ local_shap_metrics_summary.csv
 
 ---
 
+# Acknowledgement
+
+This work has been funded by a grant from the Programme Johannes Amos Comenius
+under the Ministry of Education, Youth and Sports of the Czech Republic,
+CZ.02.01.01/00/23_025/0008711.
+
+---
+
 # Licence
 
 MIT licence — see [LICENSE](LICENSE).

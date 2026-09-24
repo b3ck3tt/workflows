@@ -1,0 +1,3 @@
+# Keep p5/ (under double-blind review) out of release archives, and hence out of the Zenodo snapshot.
+# Remove this line after the review to include p5/ in the next release.
+p5 export-ignore

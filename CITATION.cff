@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "workflows: meta-learning models of machine learning workflow performance"
+license: MIT
+repository-code: "https://github.com/b3ck3tt/workflows"
+authors:
+  - family-names: Neruda
+    given-names: Roman
+    affiliation: "Institute of Computer Science, Czech Academy of Sciences"
+keywords:
+  - machine learning
+  - meta-learning
+  - performance prediction
+  - AutoML
+  - OpenML
+references:
+  - type: article
+    title: "Learning from Prior Experiments: Meta-Learning Models of Workflow Performance"
+    journal: "SN Computer Science"
+    year: 2026
+    doi: "10.1007/s42979-026-05295-9"
+    authors:
+      - family-names: Neruda
+        given-names: Roman
+      - family-names: Figueroa-García
+        given-names: Juan Carlos
+      - family-names: Franco Franco
+        given-names: Carlos Alberto
