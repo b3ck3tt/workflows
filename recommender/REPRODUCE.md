@@ -18,7 +18,7 @@ pip install -r ../requirements.txt          # + lightgbm, optuna, shap, statsmod
 
 **auto-sklearn 2.0 environment** (P3 §4.0b only — needs a legacy stack; on Apple Silicon uses osx-64):
 ```
-bash recommender_experiments/setup_asklearn_env.sh      # turnkey: creates env `asklearn64`, installs the
+bash recommender/setup_asklearn_env.sh      # turnkey: creates env `asklearn64`, installs the
                                                         # pinned stack, patches pynisher, verifies import
 ```
 This is fully scriptable (osx-64 conda env, pinned scikit-learn 0.24.2 / numpy 1.21 / scipy 1.7 / pyrfr /

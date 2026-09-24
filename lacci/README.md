@@ -25,14 +25,14 @@ per-run plots.
 jupyter notebook experiments.ipynb
 
 # 2. the repeated-shuffled protocol -> robust_predictive_anchor_v2.csv, robust_stability.csv
-python3 lacci_experiments/_robust_full.py
+python3 lacci/_robust_full.py
 
 # 3. camera-ready additions -> camera_ready_results.json
-python3 lacci_experiments/camera_ready_experiments.py
+python3 lacci/camera_ready_experiments.py
 
 # 4. figures + table/figure consistency check
-python3 lacci_experiments/make_figures.py            # renders
-python3 lacci_experiments/make_figures.py --verify-only
+python3 lacci/make_figures.py            # renders
+python3 lacci/make_figures.py --verify-only
 ```
 
 Steps 2 and 3 read the artifacts written by step 1 and take roughly 45 min and
@@ -51,9 +51,9 @@ visible in the LaTeX source. `make_figures.py` therefore parses `main.tex`,
 compares every table cell against the CSV the figure is drawn from, and exits
 non-zero on any disagreement (76 checks at the time of writing).
 
-## Relation to `sncs_experiments/`
+## Relation to `sncs/`
 
-`sncs_experiments/` is a different study on the same OpenML data: it
+`sncs/` is a different study on the same OpenML data: it
 cross-validates over shuffled splits of individual workflow–dataset evaluations
 and reports test $R^2 \approx 0.80$. The protocol here assigns all rows of a
 task to one fold and aggregates repeated evaluations of a pair into a single

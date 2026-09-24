@@ -46,7 +46,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import GroupKFold
 
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parent                      # lacci_experiments/ -> repo root
+REPO = HERE.parent                      # lacci/ -> repo root
 # The paper sources live outside the repo tree (papers/ is gitignored); override
 # with LACCI_PAPER_DIR if they are kept elsewhere.
 PAPER = Path(os.environ.get("LACCI_PAPER_DIR", REPO / "papers" / "lacci2026"))

@@ -18,7 +18,7 @@ from search import representation as R
 _MODEL = None
 _EMB_CACHE: dict[str, np.ndarray] = {}
 
-# SNCS cleanme(), verbatim (sncs_experiments/sncs_workflow_performance.ipynb, cell 4).
+# SNCS cleanme(), verbatim (sncs/sncs_workflow_performance.ipynb, cell 4).
 _CLEAN_MAP = str.maketrans({".": " ", "(": " ", ")": " ", "_": " ", ",": " ", "=": " "})
 
 

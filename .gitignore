@@ -24,7 +24,7 @@ results_cc18_*/
 results_recommender_*/
 
 
-# Local scratch dir/symlink for recommender_experiments intermediates
+# Local scratch dir/symlink for recommender intermediates
 scratch
 
 # Stray local data artifacts (regenerable; LLM pilot scores, loose result files)
@@ -35,9 +35,9 @@ longtail_census_sample.csv
 
 # SNCS notebook download caches (regenerated from OpenML by the collection cells;
 # flows3.txt alone is ~184 MB)
-sncs_experiments/*.txt
-sncs_experiments/*.joblib
-sncs_experiments/Output.csv
+sncs/*.txt
+sncs/*.joblib
+sncs/Output.csv
 
 # Standalone paper release repo (github.com/b3ck3tt/paper-tae), kept separate
 paper-tae/

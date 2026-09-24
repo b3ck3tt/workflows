@@ -121,9 +121,9 @@ experiments.ipynb     # run the experiment suite; writes per-run results + conso
 figures.ipynb         # render the paper figures (PNG + PDF) from a results dir
 figures_max.ipynb     # rendered figures for agg_mode="max"
 figures_mean.ipynb    # rendered figures for agg_mode="mean"
-lacci_experiments/    # LACCI 2026 paper: robust protocol, camera-ready experiments, figure/table checks
-sncs_experiments/     # SN Computer Science paper: the full vectorizer × regressor study
-recommender_experiments/  # warm-start recommender line: 29 scripts + REPRODUCE.md
+lacci/                # LACCI 2026 paper: robust protocol, camera-ready experiments, figure/table checks
+sncs/                 # SN Computer Science paper: the full vectorizer × regressor study
+recommender/          # warm-start recommender line: 29 scripts + REPRODUCE.md
 requirements.txt
 legacy/               # superseded modules + notebooks, kept for reference (do not import)
 ```
@@ -139,8 +139,8 @@ therefore very different numbers**. Read this before comparing them:
 
 | Directory | Paper | Protocol | Headline |
 |---|---|---|---|
-| [`sncs_experiments/`](sncs_experiments/) | *Learning from Prior Experiments: Meta-learning Models of Workflow Performance*, SN Computer Science ([10.1007/s42979-026-05295-9](https://doi.org/10.1007/s42979-026-05295-9)); extends the WEA 2025 conference paper | cross-validation over **shuffled splits of individual evaluations** — evaluations of a dataset seen in training may appear in the test fold | test *R²* ≈ 0.80 across 10 representations × 5 regressors |
-| [`lacci_experiments/`](lacci_experiments/) | *Comparing Lexical and Dense Representations for Interpretable Workflow Recommendation*, LACCI 2026 | **task-grouped** folds — all rows of a task in one fold, repeated evaluations aggregated per pair | far lower *R²*; TF-IDF ≈ MiniLM predictively but far more explainable |
+| [`sncs/`](sncs/) | *Learning from Prior Experiments: Meta-learning Models of Workflow Performance*, SN Computer Science ([10.1007/s42979-026-05295-9](https://doi.org/10.1007/s42979-026-05295-9)); extends the WEA 2025 conference paper | cross-validation over **shuffled splits of individual evaluations** — evaluations of a dataset seen in training may appear in the test fold | test *R²* ≈ 0.80 across 10 representations × 5 regressors |
+| [`lacci/`](lacci/) | *Comparing Lexical and Dense Representations for Interpretable Workflow Recommendation*, LACCI 2026 | **task-grouped** folds — all rows of a task in one fold, repeated evaluations aggregated per pair | far lower *R²*; TF-IDF ≈ MiniLM predictively but far more explainable |
 
 The gap between the two is the difference between interpolating within known
 datasets and generalizing to entirely new ones — not a contradiction. Each

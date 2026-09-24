@@ -6,7 +6,7 @@ the extended version of the WEA 2025 conference paper *Meta-learning for
 Performance Prediction of Machine Learning Models*.
 
 **This directory is the SNCS study.** The rest of this repository
-(`openml_flow.py`, `experiments.ipynb`, `recommender_experiments/`) belongs to a
+(`openml_flow.py`, `experiments.ipynb`, `recommender/`) belongs to a
 different line of work on the same data — a task-grouped, explanation-oriented
 protocol — and does **not** reproduce the numbers in the SNCS article. The two
 differ deliberately: see "Relation to the rest of the repo" below.

@@ -43,7 +43,7 @@ mpl.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parent                      # lacci_experiments/ -> repo root
+REPO = HERE.parent                      # lacci/ -> repo root
 # The paper sources live outside the repo tree (papers/ is gitignored); override
 # with LACCI_PAPER_DIR if they are kept elsewhere.
 PAPER = Path(os.environ.get("LACCI_PAPER_DIR", REPO / "papers" / "lacci2026"))

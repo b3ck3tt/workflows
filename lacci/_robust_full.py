@@ -17,7 +17,7 @@ import gc, time
 from itertools import combinations
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent   # lacci_experiments/ -> repo root
+REPO = Path(__file__).resolve().parent.parent   # lacci/ -> repo root
 
 import numpy as np
 import pandas as pd
