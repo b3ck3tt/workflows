@@ -231,4 +231,4 @@ local_shap_metrics_summary.csv
 
 # Licence
 
-MIT licence.
+MIT licence — see [LICENSE](LICENSE).
