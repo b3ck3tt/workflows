@@ -57,3 +57,9 @@ a task to one fold** and aggregates repeated evaluations of a pair into a single
 target, which is a stricter setting and yields substantially lower *R²*. The
 difference is protocol, not a contradiction — interpolating within known
 datasets versus generalizing to new ones.
+
+## Acknowledgement
+
+This work has been funded by a grant from the Programme Johannes Amos Comenius
+under the Ministry of Education, Youth and Sports of the Czech Republic,
+CZ.02.01.01/00/23_025/0008711.
